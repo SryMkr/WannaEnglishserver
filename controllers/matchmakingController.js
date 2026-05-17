@@ -36,6 +36,33 @@ function normalizeTimeoutMs(timeoutSeconds) {
     return Math.max(1000, Math.round(numericTimeoutSeconds * 1000));
 }
 
+function normalizeBoolean(value, defaultValue = false) {
+    if (value == null || value === "") {
+        return defaultValue;
+    }
+
+    if (typeof value === "boolean") {
+        return value;
+    }
+
+    if (typeof value === "number") {
+        return value !== 0;
+    }
+
+    if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase();
+        if (["true", "1", "yes", "y"].includes(normalized)) {
+            return true;
+        }
+
+        if (["false", "0", "no", "n"].includes(normalized)) {
+            return false;
+        }
+    }
+
+    return defaultValue;
+}
+
 function toIsoString(value) {
     if (!value) {
         return null;
@@ -171,6 +198,7 @@ async function initializeMatchmakingSchema() {
                 user_id BIGINT NOT NULL,
                 word_bank VARCHAR(32) NULL,
                 matched_word_bank VARCHAR(32) NULL,
+                allow_bot_fallback TINYINT(1) NOT NULL DEFAULT 1,
                 status VARCHAR(16) NOT NULL,
                 fallback_at DATETIME(3) NOT NULL,
                 room_id VARCHAR(64) NULL,
@@ -196,6 +224,12 @@ async function initializeMatchmakingSchema() {
             "matchmaking_ticket",
             "matched_word_bank",
             "matched_word_bank VARCHAR(32) NULL AFTER word_bank"
+        );
+        await ensureColumn(
+            db,
+            "matchmaking_ticket",
+            "allow_bot_fallback",
+            "allow_bot_fallback TINYINT(1) NOT NULL DEFAULT 1 AFTER matched_word_bank"
         );
         await ensureColumn(
             db,
@@ -311,7 +345,7 @@ async function loadTicket(executor, ticketId, lockRow = false) {
     const lockClause = lockRow ? " FOR UPDATE" : "";
     const [rows] = await executor.execute(
         `SELECT ticket_id, user_id, word_bank, status, fallback_at, room_id, opponent_type,
-                opponent_user_id, opponent_nickname, matched_word, matched_word_bank, created_at, updated_at,
+                opponent_user_id, opponent_nickname, matched_word, matched_word_bank, allow_bot_fallback, created_at, updated_at,
                 resolved_at, cancelled_at
          FROM matchmaking_ticket
          WHERE ticket_id = ?${lockClause}`,
@@ -325,7 +359,7 @@ async function loadWaitingTicketByUser(executor, userId, lockRow = false) {
     const lockClause = lockRow ? " FOR UPDATE" : "";
     const [rows] = await executor.execute(
         `SELECT ticket_id, user_id, word_bank, status, fallback_at, room_id, opponent_type,
-                opponent_user_id, opponent_nickname, matched_word, matched_word_bank, created_at, updated_at,
+                opponent_user_id, opponent_nickname, matched_word, matched_word_bank, allow_bot_fallback, created_at, updated_at,
                 resolved_at, cancelled_at
          FROM matchmaking_ticket
          WHERE user_id = ? AND status = 'waiting'
@@ -344,7 +378,7 @@ async function loadCandidateTickets(executor, requesterUserId, limit = 20) {
 
     const [rows] = await executor.execute(
         `SELECT ticket_id, user_id, word_bank, status, fallback_at, room_id, opponent_type,
-                opponent_user_id, opponent_nickname, matched_word, matched_word_bank, created_at, updated_at,
+                opponent_user_id, opponent_nickname, matched_word, matched_word_bank, allow_bot_fallback, created_at, updated_at,
          resolved_at, cancelled_at
          FROM matchmaking_ticket
          WHERE status = 'waiting'
@@ -370,6 +404,10 @@ async function insertRoom(executor, roomId, roomStatus, wordBank, matchedWord, o
 
 async function resolveWaitingTicketToBot(executor, ticketRow) {
     if (!ticketRow || ticketRow.status !== "waiting") {
+        return ticketRow;
+    }
+
+    if (ticketRow.allow_bot_fallback === 0 || ticketRow.allow_bot_fallback === false) {
         return ticketRow;
     }
 
@@ -484,16 +522,16 @@ async function matchWithHuman(executor, requesterUserId, wordBank) {
     return await loadTicket(executor, requesterTicketId, false);
 }
 
-async function createWaitingTicket(executor, userId, wordBank, timeoutMs) {
+async function createWaitingTicket(executor, userId, wordBank, timeoutMs, allowBotFallback = true) {
     const now = new Date();
     const fallbackAt = addMilliseconds(now, timeoutMs);
     const ticketId = buildTicketId();
 
     await executor.execute(
         `INSERT INTO matchmaking_ticket
-            (ticket_id, user_id, word_bank, status, fallback_at)
-         VALUES (?, ?, ?, 'waiting', ?)`,
-        [ticketId, userId, wordBank, fallbackAt]
+            (ticket_id, user_id, word_bank, allow_bot_fallback, status, fallback_at)
+         VALUES (?, ?, ?, ?, 'waiting', ?)`,
+        [ticketId, userId, wordBank, allowBotFallback ? 1 : 0, fallbackAt]
     );
 
     return await loadTicket(executor, ticketId, false);
@@ -560,6 +598,7 @@ exports.enqueue = async (req, res) => {
         const userId = Number(req.body.user_id);
         const wordBank = normalizeWordBank(req.body.word_bank);
         const timeoutMs = normalizeTimeoutMs(req.body.timeout_seconds);
+        const allowBotFallback = normalizeBoolean(req.body.allow_bot_fallback, true);
 
         if (!Number.isInteger(userId) || userId <= 0) {
             return res.status(400).json({ success: false, message: "user_id 无效" });
@@ -570,11 +609,21 @@ exports.enqueue = async (req, res) => {
             try {
                 let existingWaiting = await loadWaitingTicketByUser(connection, userId, true);
                 if (existingWaiting) {
+                    if (existingWaiting.allow_bot_fallback !== (allowBotFallback ? 1 : 0)) {
+                        await connection.execute(
+                            `UPDATE matchmaking_ticket
+                             SET allow_bot_fallback = ?
+                             WHERE ticket_id = ? AND status = 'waiting'`,
+                            [allowBotFallback ? 1 : 0, existingWaiting.ticket_id]
+                        );
+                        existingWaiting.allow_bot_fallback = allowBotFallback ? 1 : 0;
+                    }
+
                     const fallbackAt = existingWaiting.fallback_at instanceof Date
                         ? existingWaiting.fallback_at.getTime()
                         : new Date(existingWaiting.fallback_at).getTime();
 
-                    if (fallbackAt <= Date.now()) {
+                    if (fallbackAt <= Date.now() && existingWaiting.allow_bot_fallback !== 0 && existingWaiting.allow_bot_fallback !== false) {
                         existingWaiting = await resolveWaitingTicketToBot(connection, existingWaiting);
                     }
 
@@ -588,7 +637,7 @@ exports.enqueue = async (req, res) => {
                     return matchedTicket;
                 }
 
-                const waitingTicket = await createWaitingTicket(connection, userId, wordBank, timeoutMs);
+                const waitingTicket = await createWaitingTicket(connection, userId, wordBank, timeoutMs, allowBotFallback);
                 await connection.commit();
                 return waitingTicket;
             } catch (error) {

@@ -78,8 +78,8 @@ async function getWordId(word) {
     }
 
     const [rows] = await db.execute(
-        "SELECT word_id FROM vocabulary WHERE word_form = ? LIMIT 1",
-        [String(word).trim()]
+        "SELECT word_id FROM vocabulary WHERE LOWER(word_form) = ? LIMIT 1",
+        [normalizedKey]
     );
 
     const wordId = rows.length > 0 ? rows[0].word_id : null;

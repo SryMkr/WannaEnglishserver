@@ -22,14 +22,53 @@ function normalizeText(value) {
     return typeof value === "string" ? value.trim() : "";
 }
 
+function normalizeUserId(value) {
+    const userId = Number(value);
+    return Number.isInteger(userId) && userId > 0 ? userId : null;
+}
+
+function formatUtcDate(date) {
+    return date.toISOString().slice(0, 10);
+}
+
+function buildUtcDateSet(rows) {
+    const dates = new Set();
+    for (const row of rows) {
+        if (row == null || row.study_date == null) {
+            continue;
+        }
+
+        if (row.study_date instanceof Date) {
+            dates.add(formatUtcDate(row.study_date));
+        } else {
+            dates.add(String(row.study_date).slice(0, 10));
+        }
+    }
+
+    return dates;
+}
+
+function calculateStreakDays(rows) {
+    const dateSet = buildUtcDateSet(rows);
+    let cursor = new Date();
+    let streak = 0;
+
+    while (dateSet.has(formatUtcDate(cursor))) {
+        streak += 1;
+        cursor.setUTCDate(cursor.getUTCDate() - 1);
+    }
+
+    return streak;
+}
+
 async function getWordBase(word, wordBank) {
     if (word) {
         const [rows] = await db.execute(
             `SELECT word_id, word_form, phonetic, detail, origin, word_type, structure
              FROM vocabulary
-             WHERE word_form = ?
+             WHERE LOWER(word_form) = ?
              LIMIT 1`,
-            [word]
+            [word.trim().toLowerCase()]
         );
         return rows[0] || null;
     }
@@ -247,6 +286,24 @@ function buildStudyWordPayload(baseRow, morphology) {
     };
 }
 
+function buildSearchWordPayload(baseRow) {
+    const phonetic = parseJsonField(baseRow.phonetic, {});
+    const meanings = parseJsonField(baseRow.detail, []);
+    const primary = Array.isArray(meanings)
+        ? meanings.find(item => item && (normalizeText(item.chinese) || normalizeText(item.cn))) || meanings[0]
+        : null;
+
+    return {
+        word_id: Number(baseRow.word_id),
+        word: baseRow.word_form,
+        ipa: phonetic && typeof phonetic === "object" ? normalizeText(phonetic.ipa) : "",
+        wordType: normalizeText(primary?.type) || normalizeText(primary?.pos) || baseRow.word_type || "",
+        primaryMeaning: normalizeText(primary?.chinese) || normalizeText(primary?.cn),
+        wordBank: baseRow.word_bank || null,
+        language_level_code: baseRow.language_level_code == null ? 0 : Number(baseRow.language_level_code)
+    };
+}
+
 // === 创建 Study Session（返回 session_id） ===
 exports.createStudySession = async (req, res) => {
     try {
@@ -331,6 +388,82 @@ exports.getStudyWord = async (req, res) => {
     } catch (err) {
         console.error("getStudyWord Error:", err);
         res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
+exports.searchStudyWord = async (req, res) => {
+    try {
+        const query = typeof req.query.q === "string" ? req.query.q.trim().toLowerCase() : "";
+        if (!/^[A-Za-z][A-Za-z'-]{1,31}$/.test(query)) {
+            return res.json({ success: false, message: "请输入完整英文单词" });
+        }
+
+        const [rows] = await db.execute(
+            `SELECT
+                 v.word_id,
+                 v.word_form,
+                 v.phonetic,
+                 v.detail,
+                 v.word_type,
+                 ll.language_level_name AS word_bank,
+                 CAST(JSON_UNQUOTE(JSON_EXTRACT(vlr.language_level_codes, '$[0]')) AS UNSIGNED) AS language_level_code
+             FROM vocabulary v
+             LEFT JOIN vocabulary_level_relation vlr ON vlr.word_id = v.word_id
+             LEFT JOIN language_level_code ll
+                 ON ll.language_level_code = CAST(JSON_UNQUOTE(JSON_EXTRACT(vlr.language_level_codes, '$[0]')) AS UNSIGNED)
+             WHERE LOWER(v.word_form) = LOWER(?)
+             LIMIT 1`,
+            [query]
+        );
+
+        if (rows.length === 0) {
+            return res.json({ success: false, message: "暂未收录这个单词。" });
+        }
+
+        return res.json({ success: true, word: buildSearchWordPayload(rows[0]) });
+    } catch (err) {
+        console.error("searchStudyWord Error:", err);
+        return res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
+exports.getStudyStatsOverview = async (req, res) => {
+    try {
+        const userId = normalizeUserId(req.query.userID || req.query.user_id);
+        if (userId == null) {
+            return res.status(400).json({ success: false, message: "userID is required" });
+        }
+
+        const [studyDayRows] = await db.execute(
+            `SELECT DATE(played_at) AS study_date
+             FROM user_study_session_summary
+             WHERE game_status = 1
+               AND (user1_id = ? OR user2_id = ?)
+             GROUP BY DATE(played_at)
+             ORDER BY study_date DESC`,
+            [userId, userId]
+        );
+
+        const [wordRows] = await db.execute(
+            `SELECT
+                 COUNT(*) AS total_learned_words,
+                 SUM(CASE WHEN DATE(last_studied_at) = UTC_DATE() THEN 1 ELSE 0 END) AS today_learned_words
+             FROM user_word_progress
+             WHERE user_id = ?`,
+            [userId]
+        );
+
+        const wordStats = wordRows[0] || {};
+        return res.json({
+            success: true,
+            totalStudyDays: studyDayRows.length,
+            streakDays: calculateStreakDays(studyDayRows),
+            totalLearnedWords: Number(wordStats.total_learned_words || 0),
+            todayLearnedWords: Number(wordStats.today_learned_words || 0)
+        });
+    } catch (err) {
+        console.error("getStudyStatsOverview Error:", err);
+        return res.status(500).json({ success: false, message: "Server error" });
     }
 };
 

@@ -5,17 +5,17 @@ exports.submitSurvey = async (req, res) => {
     let connection;
 
     try {
-        // ★★★使用 Unity 的字段名，不修改★★★
         const { 
             userID, 
             surveyVersion,
             gender, 
             province, 
-            degree,        // ← 永远使用 degree
+            degree,
             suggestion 
         } = req.body;
 
-        if (userID == null || !gender || !province || !degree) {
+        const parsedUserID = Number(userID);
+        if (!Number.isInteger(parsedUserID) || parsedUserID <= 0 || !gender || !province || !degree) {
             return res.status(400).json({ error: "Missing parameters" });
         }
 
@@ -40,13 +40,13 @@ exports.submitSurvey = async (req, res) => {
                  gender_code = VALUES(gender_code),
                  province_code = VALUES(province_code),
                  education_level_code = VALUES(education_level_code)`,
-            [userID, genderCode, provinceCode, eduCode]
+            [parsedUserID, genderCode, provinceCode, eduCode]
         );
 
         const [resp] = await connection.execute(
             `INSERT INTO survey_response (user_id, survey_version)
              VALUES (?, ?)`,
-            [userID, version]
+            [parsedUserID, version]
         );
 
         const responseID = resp.insertId;

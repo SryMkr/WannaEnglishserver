@@ -68,6 +68,7 @@ app.use("/basicUserInfo", require("./routes/basicUserInfo"));
 
 // 绑定问卷路由
 app.use('/questionnaire', require('./routes/questionnaire'));
+app.use("/vocabulary-contribution", require("./routes/vocabularyContribution"));
 // 用户游戏数据路由
 app.use("/userGameData", require("./routes/userGameData"));
 // 设备信息路由
@@ -77,7 +78,9 @@ app.use("/dailySummary", require("./routes/summary"));
 app.use("/testSummary", require("./routes/testSummary"));
 app.use("/progress", require("./routes/progress"));
 app.use("/matchmaking", require("./routes/matchmaking"));
+app.use("/leaderboard", require("./routes/leaderboard"));
 app.use("/ai", require("./routes/ai"));
+app.use("/custom-training-words", require("./routes/customTrainingWords"));
 
 // 绑定学习会话路由
 app.use("/study-session", require("./routes/studySessionRoutes"));

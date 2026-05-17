@@ -38,5 +38,17 @@ module.exports = {
             "UPDATE user_profile SET session_key = ? WHERE user_id = ?",
             [sessionKey, userId]
         );
+    },
+
+    async updateWechatProfile(userId, nickname, avatarUrl) {
+        const [result] = await db.query(
+            `UPDATE user_profile
+             SET wechat_nickname = COALESCE(?, wechat_nickname),
+                 avatar_url = COALESCE(?, avatar_url)
+             WHERE user_id = ?`,
+            [nickname || null, avatarUrl || null, userId]
+        );
+
+        return result.affectedRows > 0;
     }
 };
