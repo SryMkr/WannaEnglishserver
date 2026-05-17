@@ -120,6 +120,18 @@ function toExistingWordDto(row) {
     };
 }
 
+function getLevelCodes(languageLevels) {
+    if (!Array.isArray(languageLevels)) {
+        return [];
+    }
+
+    return Array.from(new Set(
+        languageLevels
+            .map(level => Number(level.language_level_code))
+            .filter(Number.isInteger)
+    )).sort((a, b) => a - b);
+}
+
 async function ensureUserExists(connection, userID) {
     const [rows] = await connection.execute(
         "SELECT user_id FROM user_profile WHERE user_id = ? LIMIT 1",
@@ -489,6 +501,121 @@ exports.listReviewQueue = async (req, res) => {
     }
 };
 
+async function applyApprovedContributionToVocabulary(connection, contribution) {
+    const phonetic = parseJsonColumn(contribution.phonetic, {});
+    const languageLevels = parseJsonColumn(contribution.language_levels, []);
+    const detail = parseJsonColumn(contribution.detail, []);
+    const structure = parseJsonColumn(contribution.structure, []);
+    const wordForm = normalizeWord(contribution.word_form);
+    const targetWord = normalizeWord(contribution.target_word);
+    const levelCodes = getLevelCodes(languageLevels);
+
+    if (!wordForm || !Array.isArray(detail) || detail.length === 0 || levelCodes.length === 0) {
+        throw new Error("Invalid approved contribution payload");
+    }
+
+    if (contribution.submission_type === "correction") {
+        const [targetRows] = await connection.execute(
+            `SELECT word_id
+             FROM vocabulary
+             WHERE word_form = ?
+             FOR UPDATE`,
+            [targetWord || wordForm]
+        );
+
+        if (targetRows.length === 0) {
+            throw new Error("Target vocabulary word not found");
+        }
+
+        const wordID = targetRows[0].word_id;
+        const [sameWordRows] = await connection.execute(
+            `SELECT word_id
+             FROM vocabulary
+             WHERE word_form = ?
+             FOR UPDATE`,
+            [wordForm]
+        );
+
+        if (sameWordRows.length > 0 && Number(sameWordRows[0].word_id) !== Number(wordID)) {
+            throw new Error("Corrected word form already exists");
+        }
+
+        await connection.execute(
+            `UPDATE vocabulary
+             SET word_form = ?,
+                 phonetic = ?,
+                 detail = ?,
+                 origin = ?,
+                 word_type = ?,
+                 structure = ?
+             WHERE word_id = ?`,
+            [
+                wordForm,
+                JSON.stringify(phonetic),
+                JSON.stringify(detail),
+                contribution.origin || null,
+                contribution.word_type,
+                JSON.stringify(Array.isArray(structure) ? structure : []),
+                wordID
+            ]
+        );
+
+        await connection.execute(
+            `INSERT INTO vocabulary_level_relation (word_id, language_level_codes)
+             VALUES (?, ?)
+             ON DUPLICATE KEY UPDATE
+                 language_level_codes = VALUES(language_level_codes)`,
+            [wordID, JSON.stringify(levelCodes)]
+        );
+        return wordID;
+    }
+
+    const [result] = await connection.execute(
+        `INSERT INTO vocabulary
+         (word_form, phonetic, audio_url, detail, origin, word_type, structure)
+         VALUES (?, ?, NULL, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+             phonetic = VALUES(phonetic),
+             detail = VALUES(detail),
+             origin = VALUES(origin),
+             word_type = VALUES(word_type),
+             structure = VALUES(structure)`,
+        [
+            wordForm,
+            JSON.stringify(phonetic),
+            JSON.stringify(detail),
+            contribution.origin || null,
+            contribution.word_type,
+            JSON.stringify(Array.isArray(structure) ? structure : [])
+        ]
+    );
+
+    let wordID = result.insertId;
+    if (!wordID) {
+        const [rows] = await connection.execute(
+            `SELECT word_id
+             FROM vocabulary
+             WHERE word_form = ?
+             LIMIT 1`,
+            [wordForm]
+        );
+        if (rows.length === 0) {
+            throw new Error("Vocabulary upsert failed");
+        }
+        wordID = rows[0].word_id;
+    }
+
+    await connection.execute(
+        `INSERT INTO vocabulary_level_relation (word_id, language_level_codes)
+         VALUES (?, ?)
+         ON DUPLICATE KEY UPDATE
+             language_level_codes = VALUES(language_level_codes)`,
+        [wordID, JSON.stringify(levelCodes)]
+    );
+
+    return wordID;
+}
+
 exports.reviewContribution = async (req, res) => {
     const contributionID = parsePositiveInteger(req.params.id);
     const reviewerUserID = parsePositiveInteger(req.body.userID ?? req.body.user_id);
@@ -514,7 +641,7 @@ exports.reviewContribution = async (req, res) => {
         }
 
         const [rows] = await connection.execute(
-            `SELECT contribution_id, submitter_user_id, status
+            `SELECT *
              FROM vocabulary_contribution
              WHERE contribution_id = ?
              FOR UPDATE`,
@@ -541,6 +668,11 @@ exports.reviewContribution = async (req, res) => {
             [contributionID, reviewerUserID, reviewerUserName, decision, note]
         );
 
+        let vocabularyWordID = null;
+        if (decision === "approved") {
+            vocabularyWordID = await applyApprovedContributionToVocabulary(connection, rows[0]);
+        }
+
         await connection.execute(
             `UPDATE vocabulary_contribution
              SET status = ?, reviewed_at = CURRENT_TIMESTAMP
@@ -552,7 +684,8 @@ exports.reviewContribution = async (req, res) => {
         return res.json({
             success: true,
             contributionID,
-            status: decision
+            status: decision,
+            vocabularyWordID
         });
     } catch (error) {
         console.error("Vocabulary contribution review error:", error);
