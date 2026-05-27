@@ -5,7 +5,7 @@ const userModel = require("../models/userModel");
 const APPID = process.env.WECHAT_APPID || "wx23d6c390c37981e8";
 const SECRET = process.env.WECHAT_SECRET || "3847430c53055e735a82584cd5296550";
 const MESSAGE_TOKEN = process.env.WECHAT_MESSAGE_TOKEN || process.env.WECHAT_TOKEN || "";
-const H5_HOME_URL = (process.env.H5_HOME_URL || "https://h5.lyzlearn.com/").trim();
+const H5_HOME_URL = (process.env.H5_HOME_URL || "https://app.lyzlearn.com/").trim();
 
 let cachedAccessToken = null;
 let cachedAccessTokenExpiresAt = 0;
