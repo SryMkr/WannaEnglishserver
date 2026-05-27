@@ -50,18 +50,10 @@ function isCustomerServiceEntryEvent(message) {
     return message.msgType === "event" && message.event === "user_enter_tempsession";
 }
 
-function shouldSendPlayerCenterText(message) {
-    return isCustomerServiceEntryEvent(message) || message.msgType === "text";
-}
-
 function buildH5HomeUrl(user) {
     const url = new URL(H5_HOME_URL);
     if (user?.user_id) {
         url.searchParams.set("userID", String(user.user_id));
-    }
-
-    if (user?.wechat_nickname) {
-        url.searchParams.set("userName", user.wechat_nickname);
     }
 
     return url.toString();
@@ -205,7 +197,6 @@ module.exports = {
             fromUserName: parseXmlValue(xml, "FromUserName"),
             msgType: parseXmlValue(xml, "MsgType"),
             event: parseXmlValue(xml, "Event"),
-            content: parseXmlValue(xml, "Content"),
             sessionFrom: parseXmlValue(xml, "SessionFrom")
         };
 
@@ -213,13 +204,12 @@ module.exports = {
             openid: message.fromUserName,
             msgType: message.msgType,
             event: message.event,
-            content: message.content,
             sessionFrom: message.sessionFrom
         });
 
         res.send("success");
 
-        if (!shouldSendPlayerCenterText(message)) {
+        if (!isCustomerServiceEntryEvent(message)) {
             return;
         }
 
