@@ -3,7 +3,7 @@ const db = require('../config/db');
 module.exports = {
     async findByOpenId(openid) {
         const [rows] = await db.query(
-            "SELECT user_id, open_id FROM user_profile WHERE open_id = ? LIMIT 1",
+            "SELECT user_id, open_id, wechat_nickname FROM user_profile WHERE open_id = ? LIMIT 1",
             [openid]
         );
         return rows[0] || null;

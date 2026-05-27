@@ -113,86 +113,108 @@ async function queryLeaderboard(period, wordBankFilter, currentWordBank, userId)
     const base = buildBaseQuery(period, wordBankFilter, currentWordBank);
 
     const sql = `
-        WITH filtered_sessions AS (
-            SELECT
-                s.session_id,
-                COALESCE(s.match_room_id, CONCAT('session:', s.session_id)) AS match_key,
-                s.user1_id,
-                s.user2_id,
-                s.winner_user_id,
-                s.duration,
-                s.played_at
-            FROM user_study_session_summary s
-            LEFT JOIN matchmaking_ticket mt ON mt.room_id = s.match_room_id
-            WHERE ${base.whereSql}
-        ),
-        deduped_matches AS (
-            SELECT *
-            FROM (
-                SELECT
-                    filtered_sessions.*,
-                    ROW_NUMBER() OVER (PARTITION BY match_key ORDER BY played_at ASC, session_id ASC) AS row_num
-                FROM filtered_sessions
-            ) ranked_sessions
-            WHERE row_num = 1
-        ),
-        participants AS (
-            SELECT
-                user1_id AS user_id,
-                winner_user_id,
-                duration
-            FROM deduped_matches
-            UNION ALL
-            SELECT
-                user2_id AS user_id,
-                winner_user_id,
-                duration
-            FROM deduped_matches
-        ),
-        user_stats AS (
-            SELECT
-                user_id,
-                SUM(CASE WHEN user_id = winner_user_id THEN 1 ELSE 0 END) AS wins,
-                COUNT(*) AS matches,
-                AVG(NULLIF(duration, 0)) AS avg_duration
-            FROM participants
-            GROUP BY user_id
-        ),
-        ranked_stats AS (
-            SELECT
-                user_id,
-                wins,
-                matches,
-                avg_duration,
-                ROW_NUMBER() OVER (
-                    ORDER BY wins DESC, (wins / NULLIF(matches, 0)) DESC, COALESCE(avg_duration, 999999) ASC, user_id ASC
-                ) AS ranking
-            FROM user_stats
-        )
         SELECT
-            ranking AS rank_position,
-            ranked_stats.user_id,
-            COALESCE(NULLIF(up.wechat_nickname, ''), CONCAT(?, ranking)) AS display_name,
-            wins,
-            matches,
-            avg_duration
-        FROM ranked_stats
-        LEFT JOIN user_profile up ON up.user_id = ranked_stats.user_id
-        WHERE ranking <= ?
-           OR (? IS NOT NULL AND ranked_stats.user_id = ?)
-        ORDER BY ranking ASC
+            s.session_id,
+            COALESCE(s.match_room_id, CONCAT('session:', s.session_id)) AS match_key,
+            s.user1_id,
+            s.user2_id,
+            s.winner_user_id,
+            s.duration,
+            s.played_at,
+            up1.wechat_nickname AS user1_nickname,
+            up2.wechat_nickname AS user2_nickname
+        FROM user_study_session_summary s
+        LEFT JOIN matchmaking_ticket mt ON mt.room_id = s.match_room_id
+        LEFT JOIN user_profile up1 ON up1.user_id = s.user1_id
+        LEFT JOIN user_profile up2 ON up2.user_id = s.user2_id
+        WHERE ${base.whereSql}
+        ORDER BY s.played_at ASC, s.session_id ASC
     `;
 
-    const params = [
-        ...base.params,
-        "编",
-        TOP_LIMIT,
-        userId,
-        userId
-    ];
+    const [sessions] = await db.execute(sql, base.params);
+    const seenMatchKeys = new Set();
+    const statsByUserId = new Map();
 
-    const [rows] = await db.execute(sql, params);
-    return rows;
+    function ensureStats(participantUserId, displayName) {
+        const numericUserId = Number(participantUserId || 0);
+        if (numericUserId <= 0) {
+            return null;
+        }
+
+        if (!statsByUserId.has(numericUserId)) {
+            statsByUserId.set(numericUserId, {
+                user_id: numericUserId,
+                display_name: displayName || buildDisplayName(numericUserId),
+                wins: 0,
+                matches: 0,
+                duration_total: 0,
+                duration_count: 0
+            });
+        }
+
+        return statsByUserId.get(numericUserId);
+    }
+
+    for (const session of sessions) {
+        const matchKey = session.match_key || `session:${session.session_id}`;
+        if (seenMatchKeys.has(matchKey)) {
+            continue;
+        }
+        seenMatchKeys.add(matchKey);
+
+        const participants = [
+            { userId: session.user1_id, nickname: session.user1_nickname },
+            { userId: session.user2_id, nickname: session.user2_nickname }
+        ];
+
+        for (const participant of participants) {
+            const stats = ensureStats(participant.userId, participant.nickname);
+            if (!stats) {
+                continue;
+            }
+
+            stats.matches += 1;
+            if (Number(participant.userId) === Number(session.winner_user_id)) {
+                stats.wins += 1;
+            }
+            if (Number(session.duration || 0) > 0) {
+                stats.duration_total += Number(session.duration);
+                stats.duration_count += 1;
+            }
+        }
+    }
+
+    const rankedRows = Array.from(statsByUserId.values())
+        .map(stats => ({
+            rank_position: 0,
+            user_id: stats.user_id,
+            display_name: stats.display_name,
+            wins: stats.wins,
+            matches: stats.matches,
+            avg_duration: stats.duration_count > 0 ? stats.duration_total / stats.duration_count : null
+        }))
+        .sort((a, b) => {
+            const winDiff = Number(b.wins) - Number(a.wins);
+            if (winDiff !== 0) return winDiff;
+
+            const aWinRate = Number(a.matches) > 0 ? Number(a.wins) / Number(a.matches) : 0;
+            const bWinRate = Number(b.matches) > 0 ? Number(b.wins) / Number(b.matches) : 0;
+            const winRateDiff = bWinRate - aWinRate;
+            if (winRateDiff !== 0) return winRateDiff;
+
+            const aDuration = a.avg_duration == null ? Number.MAX_SAFE_INTEGER : Number(a.avg_duration);
+            const bDuration = b.avg_duration == null ? Number.MAX_SAFE_INTEGER : Number(b.avg_duration);
+            const durationDiff = aDuration - bDuration;
+            if (durationDiff !== 0) return durationDiff;
+
+            return Number(a.user_id) - Number(b.user_id);
+        });
+
+    rankedRows.forEach((row, index) => {
+        row.rank_position = index + 1;
+    });
+
+    return rankedRows.filter(row => row.rank_position <= TOP_LIMIT || (userId != null && Number(row.user_id) === userId));
 }
 
 exports.getCompetitiveLeaderboard = async (req, res) => {

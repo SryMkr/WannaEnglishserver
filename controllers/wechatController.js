@@ -1,8 +1,14 @@
 const axios = require("axios");
+const crypto = require("crypto");
 const userModel = require("../models/userModel");
 
 const APPID = process.env.WECHAT_APPID || "wx23d6c390c37981e8";
 const SECRET = process.env.WECHAT_SECRET || "3847430c53055e735a82584cd5296550";
+const MESSAGE_TOKEN = process.env.WECHAT_MESSAGE_TOKEN || process.env.WECHAT_TOKEN || "";
+const H5_HOME_URL = (process.env.H5_HOME_URL || "https://h5.lyzlearn.com/").trim();
+
+let cachedAccessToken = null;
+let cachedAccessTokenExpiresAt = 0;
 
 function normalizeOptionalString(value, maxLength) {
     if (typeof value !== "string") {
@@ -15,6 +21,101 @@ function normalizeOptionalString(value, maxLength) {
     }
 
     return trimmed.length > maxLength ? trimmed.slice(0, maxLength) : trimmed;
+}
+
+function isValidWechatSignature(signature, timestamp, nonce) {
+    if (!MESSAGE_TOKEN || !signature || !timestamp || !nonce) {
+        return false;
+    }
+
+    const expected = crypto
+        .createHash("sha1")
+        .update([MESSAGE_TOKEN, timestamp, nonce].sort().join(""))
+        .digest("hex");
+
+    return expected === signature;
+}
+
+function parseXmlValue(xml, tagName) {
+    if (typeof xml !== "string" || !tagName) {
+        return "";
+    }
+
+    const pattern = new RegExp(`<${tagName}>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?</${tagName}>`);
+    const match = xml.match(pattern);
+    return match ? match[1].trim() : "";
+}
+
+function isCustomerServiceEntryEvent(message) {
+    return message.msgType === "event" && message.event === "user_enter_tempsession";
+}
+
+function buildH5HomeUrl(user) {
+    const url = new URL(H5_HOME_URL);
+    if (user?.user_id) {
+        url.searchParams.set("userID", String(user.user_id));
+    }
+
+    if (user?.wechat_nickname) {
+        url.searchParams.set("userName", user.wechat_nickname);
+    }
+
+    return url.toString();
+}
+
+async function getWechatAccessToken() {
+    const now = Date.now();
+    if (cachedAccessToken && cachedAccessTokenExpiresAt - now > 60 * 1000) {
+        return cachedAccessToken;
+    }
+
+    const url = "https://api.weixin.qq.com/cgi-bin/token";
+    const response = await axios.get(url, {
+        params: {
+            grant_type: "client_credential",
+            appid: APPID,
+            secret: SECRET
+        },
+        timeout: 5000
+    });
+
+    if (!response.data?.access_token) {
+        throw new Error(`wechat_access_token_failed:${JSON.stringify(response.data)}`);
+    }
+
+    cachedAccessToken = response.data.access_token;
+    cachedAccessTokenExpiresAt = now + Number(response.data.expires_in || 7200) * 1000;
+    return cachedAccessToken;
+}
+
+async function sendCustomerServiceText(openid) {
+    if (!openid) {
+        return;
+    }
+
+    const user = await userModel.findByOpenId(openid);
+    const h5HomeUrl = buildH5HomeUrl(user);
+    const accessToken = await getWechatAccessToken();
+    const messageUrl = `https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=${encodeURIComponent(accessToken)}`;
+    const content = [
+        "欢迎来到 WannaEnglish 玩家中心。",
+        `问卷调查和词库共享入口：${h5HomeUrl}`,
+        "进入页面后可选择“问卷页面”或“词条贡献页面”。"
+    ].join("\n");
+
+    const response = await axios.post(
+        messageUrl,
+        {
+            touser: openid,
+            msgtype: "text",
+            text: { content }
+        },
+        { timeout: 5000 }
+    );
+
+    if (response.data?.errcode) {
+        throw new Error(`wechat_customer_service_send_failed:${JSON.stringify(response.data)}`);
+    }
 }
 
 module.exports = {
@@ -76,6 +177,48 @@ module.exports = {
         } catch (err) {
             console.error("WeChat profile save error:", err);
             res.status(500).json({ error: "server_error" });
+        }
+    },
+
+    verifyCustomerServiceWebhook: (req, res) => {
+        const { signature, timestamp, nonce, echostr } = req.query;
+
+        if (!isValidWechatSignature(signature, timestamp, nonce)) {
+            return res.status(403).send("invalid signature");
+        }
+
+        return res.send(echostr || "");
+    },
+
+    handleCustomerServiceMessage: async (req, res) => {
+        const { signature, timestamp, nonce } = req.query;
+        if (!isValidWechatSignature(signature, timestamp, nonce)) {
+            return res.status(403).send("invalid signature");
+        }
+
+        const xml = typeof req.body === "string" ? req.body : "";
+        const message = {
+            toUserName: parseXmlValue(xml, "ToUserName"),
+            fromUserName: parseXmlValue(xml, "FromUserName"),
+            msgType: parseXmlValue(xml, "MsgType"),
+            event: parseXmlValue(xml, "Event"),
+            sessionFrom: parseXmlValue(xml, "SessionFrom")
+        };
+
+        res.send("success");
+
+        if (!isCustomerServiceEntryEvent(message)) {
+            return;
+        }
+
+        try {
+            await sendCustomerServiceText(message.fromUserName);
+            console.log("WeChat customer service auto reply sent:", {
+                openid: message.fromUserName,
+                sessionFrom: message.sessionFrom
+            });
+        } catch (err) {
+            console.error("WeChat customer service auto reply error:", err);
         }
     }
 };
