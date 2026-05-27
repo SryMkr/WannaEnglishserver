@@ -50,6 +50,10 @@ function isCustomerServiceEntryEvent(message) {
     return message.msgType === "event" && message.event === "user_enter_tempsession";
 }
 
+function shouldSendPlayerCenterText(message) {
+    return isCustomerServiceEntryEvent(message) || message.msgType === "text";
+}
+
 function buildH5HomeUrl(user) {
     const url = new URL(H5_HOME_URL);
     if (user?.user_id) {
@@ -98,9 +102,8 @@ async function sendCustomerServiceText(openid) {
     const accessToken = await getWechatAccessToken();
     const messageUrl = `https://api.weixin.qq.com/cgi-bin/message/custom/send?access_token=${encodeURIComponent(accessToken)}`;
     const content = [
-        "欢迎来到 WannaEnglish 玩家中心。",
-        `问卷调查和词库共享入口：${h5HomeUrl}`,
-        "进入页面后可选择“问卷页面”或“词条贡献页面”。"
+        "WannaEnglish 玩家中心",
+        h5HomeUrl
     ].join("\n");
 
     const response = await axios.post(
@@ -202,12 +205,21 @@ module.exports = {
             fromUserName: parseXmlValue(xml, "FromUserName"),
             msgType: parseXmlValue(xml, "MsgType"),
             event: parseXmlValue(xml, "Event"),
+            content: parseXmlValue(xml, "Content"),
             sessionFrom: parseXmlValue(xml, "SessionFrom")
         };
 
+        console.log("WeChat customer service webhook received:", {
+            openid: message.fromUserName,
+            msgType: message.msgType,
+            event: message.event,
+            content: message.content,
+            sessionFrom: message.sessionFrom
+        });
+
         res.send("success");
 
-        if (!isCustomerServiceEntryEvent(message)) {
+        if (!shouldSendPlayerCenterText(message)) {
             return;
         }
 
