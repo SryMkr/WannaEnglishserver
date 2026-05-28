@@ -8,5 +8,6 @@ router.post("/cancel", controller.cancel);
 router.post("/rematch", controller.rematch);
 router.post("/heartbeat", controller.heartbeat);
 router.post("/resume", controller.resume);
+router.post("/leave", controller.leave);
 
 module.exports = router;

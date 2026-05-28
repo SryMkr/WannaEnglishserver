@@ -4,6 +4,9 @@ const {
     getWordBankLevelCode,
     normalizeWordBank
 } = require("../services/wordBankService");
+const {
+    abandonMatchedRoom
+} = require("../services/matchRoomLifecycleService");
 
 const ROOM_TTL_MINUTES = Math.max(5, Number(process.env.FRIEND_ROOM_TTL_MINUTES) || 30);
 
@@ -244,6 +247,35 @@ async function expireRoomIfNeeded(executor, room) {
     return await loadRoomByInviteOrCode(executor, { inviteId: room.invite_id }, false);
 }
 
+async function syncMatchedRoomState(executor, room, lockMatchRoom = false) {
+    if (!room || room.status !== "matched" || !room.match_room_id) {
+        return room;
+    }
+
+    const lockClause = lockMatchRoom ? " FOR UPDATE" : "";
+    const [rows] = await executor.execute(
+        `SELECT room_status
+         FROM matchmaking_room
+         WHERE room_id = ?${lockClause}
+         LIMIT 1`,
+        [room.match_room_id]
+    );
+
+    if (rows.length > 0 && rows[0].room_status === "matched") {
+        return room;
+    }
+
+    await connectionSafeCancelFriendRoom(executor, room.invite_id);
+    return await loadRoomByInviteOrCode(executor, { inviteId: room.invite_id }, false);
+}
+
+async function connectionSafeCancelFriendRoom(executor, inviteId) {
+    await executor.execute(
+        "UPDATE friend_room SET status = 'cancelled' WHERE invite_id = ? AND status IN ('waiting', 'joined', 'matched')",
+        [inviteId]
+    );
+}
+
 async function pickWord(wordBank, executor = db) {
     const normalizedWordBank = normalizeWordBank(wordBank);
     const levelCode = getWordBankLevelCode(normalizedWordBank);
@@ -405,6 +437,7 @@ async function join(req, res) {
                     roomCode: req.body.room_code || req.body.roomCode
                 }, true);
                 room = await expireRoomIfNeeded(connection, room);
+                room = await syncMatchedRoomState(connection, room, true);
 
                 if (!room) {
                     await connection.rollback();
@@ -473,6 +506,7 @@ async function status(req, res) {
                     roomCode: req.query.room_code || req.query.roomCode
                 }, true);
                 room = await expireRoomIfNeeded(connection, room);
+                room = await syncMatchedRoomState(connection, room, true);
                 await connection.commit();
                 return room;
             } catch (error) {
@@ -513,6 +547,7 @@ async function ready(req, res) {
                     roomCode: req.body.room_code || req.body.roomCode
                 }, true);
                 room = await expireRoomIfNeeded(connection, room);
+                room = await syncMatchedRoomState(connection, room, true);
 
                 if (!room) {
                     await connection.rollback();
@@ -577,28 +612,16 @@ async function leave(req, res) {
                     return { statusCode: 404, body: { success: false, message: "房间不存在" } };
                 }
 
-                if (room.status === "matched") {
-                    await connection.commit();
-                    return { statusCode: 200, body: buildRoomResponse(room, userId, "房间已进入对局") };
-                }
-
-                if (Number(room.host_user_id) === userId) {
-                    await connection.execute(
-                        "UPDATE friend_room SET status = 'cancelled' WHERE invite_id = ? AND status IN ('waiting', 'joined')",
-                        [room.invite_id]
-                    );
-                } else if (Number(room.guest_user_id || 0) === userId) {
-                    await connection.execute(
-                        `UPDATE friend_room
-                         SET guest_user_id = NULL, guest_ready = 0, host_ready = 0, status = 'waiting'
-                         WHERE invite_id = ? AND status = 'joined'`,
-                        [room.invite_id]
-                    );
-                } else {
+                if (Number(room.host_user_id) !== userId && Number(room.guest_user_id || 0) !== userId) {
                     await connection.rollback();
                     return { statusCode: 403, body: { success: false, message: "你不在这个房间中" } };
                 }
 
+                if (room.match_room_id) {
+                    await abandonMatchedRoom(connection, room.match_room_id);
+                }
+
+                await connectionSafeCancelFriendRoom(connection, room.invite_id);
                 const updated = await loadRoomByInviteOrCode(connection, { inviteId: room.invite_id }, false);
                 await connection.commit();
                 return { statusCode: 200, body: buildRoomResponse(updated, userId) };

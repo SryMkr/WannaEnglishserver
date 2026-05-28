@@ -4,6 +4,9 @@ const {
     normalizeWordBank,
     resolveSharedWordBank
 } = require("../services/wordBankService");
+const {
+    abandonMatchedRoom
+} = require("../services/matchRoomLifecycleService");
 
 const DEFAULT_MATCH_TIMEOUT_MS = Math.max(1000, Number(process.env.MATCH_TIMEOUT_MS) || 5000);
 const BOT_USER_ID = Number(process.env.MATCH_BOT_USER_ID) || 1002;
@@ -886,8 +889,26 @@ exports.cancel = async (req, res) => {
                 }
 
                 if (ticket.status === "matched") {
+                    if (!ticket.room_id || ticket.opponent_type !== "human") {
+                        await connection.commit();
+                        return { statusCode: 409, body: { success: false, message: "该匹配已出结果，不能取消" } };
+                    }
+
+                    const room = await loadRoomById(connection, ticket.room_id, true);
+                    if (!room) {
+                        await connection.commit();
+                        return { statusCode: 404, body: { success: false, message: "房间不存在" } };
+                    }
+
+                    const slot = resolveRoomUserSlot(room, userId);
+                    if (!slot) {
+                        await connection.commit();
+                        return { statusCode: 403, body: { success: false, message: "你不在这个房间中" } };
+                    }
+
+                    await abandonMatchedRoom(connection, ticket.room_id, slot.selfColumn);
                     await connection.commit();
-                    return { statusCode: 409, body: { success: false, message: "该匹配已出结果，不能取消" } };
+                    return { statusCode: 200, body: { success: true, status: "cancelled", ticket_id: ticketId, room_id: ticket.room_id } };
                 }
 
                 if (ticket.status !== "waiting") {
@@ -1148,21 +1169,7 @@ exports.resume = async (req, res) => {
                 }
 
                 if (!isPresenceFresh(room[slot.opponentColumn])) {
-                    await connection.execute(
-                        `UPDATE matchmaking_room
-                         SET room_status = 'abandoned',
-                             finished_at = UTC_TIMESTAMP(3),
-                             ${slot.selfColumn} = UTC_TIMESTAMP(3)
-                         WHERE room_id = ? AND room_status = 'matched'`,
-                        [roomId]
-                    );
-                    await connection.execute(
-                        `UPDATE matchmaking_ticket
-                         SET status = 'cancelled',
-                             cancelled_at = UTC_TIMESTAMP(3)
-                         WHERE room_id = ? AND status = 'matched'`,
-                        [roomId]
-                    );
+                    await abandonMatchedRoom(connection, roomId, slot.selfColumn);
                     await connection.commit();
                     return { statusCode: 409, body: { success: false, message: "对方已不在房间中，房间已失效", status: "abandoned" } };
                 }
@@ -1191,6 +1198,62 @@ exports.resume = async (req, res) => {
         return res.status(outcome.statusCode).json(outcome.body);
     } catch (err) {
         console.error("matchmaking resume error:", err);
+        return res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
+exports.leave = async (req, res) => {
+    try {
+        await initializeMatchmakingSchema();
+
+        const userId = Number(req.body.user_id);
+        const roomId = typeof req.body.room_id === "string" ? req.body.room_id.trim() : "";
+
+        if (!Number.isInteger(userId) || userId <= 0) {
+            return res.status(400).json({ success: false, message: "user_id 无效" });
+        }
+
+        if (!roomId) {
+            return res.status(400).json({ success: false, message: "room_id 不能为空" });
+        }
+
+        const outcome = await withConnection(async connection => {
+            await connection.beginTransaction();
+            try {
+                const room = await loadRoomById(connection, roomId, true);
+                if (!room) {
+                    await connection.rollback();
+                    return { statusCode: 404, body: { success: false, message: "房间不存在" } };
+                }
+
+                const slot = resolveRoomUserSlot(room, userId);
+                if (!slot) {
+                    await connection.rollback();
+                    return { statusCode: 403, body: { success: false, message: "你不在这个房间中" } };
+                }
+
+                if (room.room_status === "matched") {
+                    await abandonMatchedRoom(connection, roomId, slot.selfColumn);
+                }
+
+                await connection.commit();
+                return {
+                    statusCode: 200,
+                    body: {
+                        success: true,
+                        status: room.room_status === "matched" ? "abandoned" : room.room_status,
+                        room_id: roomId
+                    }
+                };
+            } catch (error) {
+                await connection.rollback();
+                throw error;
+            }
+        });
+
+        return res.status(outcome.statusCode).json(outcome.body);
+    } catch (err) {
+        console.error("matchmaking leave error:", err);
         return res.status(500).json({ success: false, message: "Server error" });
     }
 };
