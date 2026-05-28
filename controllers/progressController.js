@@ -15,16 +15,14 @@ exports.saveWordProgress = async (req, res) => {
             return res.status(400).json({ error: "Unknown word: " + word });
         }
 
-        const nowUTC = new Date().toISOString().slice(0, 19).replace('T', ' ');
-
         await db.execute(
             `INSERT INTO user_word_progress
              (user_id, word_id, word_proficiency, study_count, last_studied_at)
-             VALUES (?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
              ON DUPLICATE KEY UPDATE
                 study_count = study_count + 1,
                 last_studied_at = VALUES(last_studied_at)`,
-            [userID, wordID, 0, 1, nowUTC]
+            [userID, wordID, 0, 1]
         );
 
         return res.json({ success: true });

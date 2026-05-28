@@ -7,11 +7,16 @@ const {
 const {
     abandonMatchedRoom
 } = require("../services/matchRoomLifecycleService");
+const { formatChinaIsoDateTime } = require("../services/timeService");
 
 const DEFAULT_MATCH_TIMEOUT_MS = Math.max(1000, Number(process.env.MATCH_TIMEOUT_MS) || 5000);
 const BOT_USER_ID = Number(process.env.MATCH_BOT_USER_ID) || 1002;
 const BOT_OPEN_ID = process.env.MATCH_BOT_OPEN_ID || `system-bot-${BOT_USER_ID}`;
 const ROOM_PRESENCE_TIMEOUT_SECONDS = Math.max(5, Number(process.env.MATCH_ROOM_PRESENCE_TIMEOUT_SECONDS) || 12);
+const ROOM_RESUME_GRACE_SECONDS = Math.max(
+    ROOM_PRESENCE_TIMEOUT_SECONDS,
+    Number(process.env.MATCH_ROOM_RESUME_GRACE_SECONDS) || 60
+);
 const REMATCH_WAIT_TIMEOUT_SECONDS = Math.max(5, Number(process.env.MATCH_REMATCH_WAIT_TIMEOUT_SECONDS) || 20);
 
 let ticketSequence = 0;
@@ -74,11 +79,7 @@ function toIsoString(value) {
     }
 
     const date = value instanceof Date ? value : new Date(value);
-    return Number.isNaN(date.getTime()) ? null : date.toISOString();
-}
-
-function addMilliseconds(date, milliseconds) {
-    return new Date(date.getTime() + milliseconds);
+    return Number.isNaN(date.getTime()) ? null : formatChinaIsoDateTime(date, 3);
 }
 
 function buildOpponent(row) {
@@ -465,7 +466,7 @@ async function loadCandidateTickets(executor, requesterUserId, limit = 20) {
          FROM matchmaking_ticket
          WHERE status = 'waiting'
            AND user_id <> ?
-           AND fallback_at > UTC_TIMESTAMP(3)
+           AND fallback_at > CURRENT_TIMESTAMP(3)
          ORDER BY created_at ASC
          LIMIT ${safeLimit}
          FOR UPDATE`,
@@ -476,12 +477,18 @@ async function loadCandidateTickets(executor, requesterUserId, limit = 20) {
 }
 
 async function insertRoom(executor, roomId, roomStatus, wordBank, matchedWord, opponentType, user1Id, user2Id, matchedAt) {
+    const timestampSql = matchedAt === "CURRENT_TIMESTAMP(3)" ? "CURRENT_TIMESTAMP(3)" : "?";
+    const params = [roomId, roomStatus, wordBank, matchedWord, opponentType, user1Id, user2Id];
+    if (timestampSql !== "CURRENT_TIMESTAMP(3)") {
+        params.push(matchedAt, matchedAt, matchedAt);
+    }
+
     await executor.execute(
         `INSERT INTO matchmaking_room
             (room_id, room_status, word_bank, matched_word, opponent_type, user1_id, user2_id,
              user1_last_seen_at, user2_last_seen_at, matched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [roomId, roomStatus, wordBank, matchedWord, opponentType, user1Id, user2Id, matchedAt, matchedAt, matchedAt]
+         VALUES (?, ?, ?, ?, ?, ?, ?, ${timestampSql}, ${timestampSql}, ${timestampSql})`,
+        params
     );
 }
 
@@ -490,6 +497,8 @@ async function loadRoomById(executor, roomId, lockRow = false) {
     const [rows] = await executor.execute(
         `SELECT room_id, room_status, word_bank, matched_word, match_round_no,
                 opponent_type, user1_id, user2_id, user1_last_seen_at, user2_last_seen_at,
+                TIMESTAMPDIFF(SECOND, user1_last_seen_at, CURRENT_TIMESTAMP(3)) AS user1_last_seen_age_seconds,
+                TIMESTAMPDIFF(SECOND, user2_last_seen_at, CURRENT_TIMESTAMP(3)) AS user2_last_seen_age_seconds,
                 user1_rematch_round_no, user2_rematch_round_no, rematch_requested_at, matched_at
          FROM matchmaking_room
          WHERE room_id = ?${lockClause}`,
@@ -508,6 +517,8 @@ function resolveRoomUserSlot(room, userId) {
         return {
             selfColumn: "user1_last_seen_at",
             opponentColumn: "user2_last_seen_at",
+            selfAgeColumn: "user1_last_seen_age_seconds",
+            opponentAgeColumn: "user2_last_seen_age_seconds",
             selfRematchColumn: "user1_rematch_round_no",
             opponentRematchColumn: "user2_rematch_round_no",
             opponentUserId: Number(room.user2_id || 0)
@@ -518,6 +529,8 @@ function resolveRoomUserSlot(room, userId) {
         return {
             selfColumn: "user2_last_seen_at",
             opponentColumn: "user1_last_seen_at",
+            selfAgeColumn: "user2_last_seen_age_seconds",
+            opponentAgeColumn: "user1_last_seen_age_seconds",
             selfRematchColumn: "user2_rematch_round_no",
             opponentRematchColumn: "user1_rematch_round_no",
             opponentUserId: Number(room.user1_id || 0)
@@ -527,18 +540,14 @@ function resolveRoomUserSlot(room, userId) {
     return null;
 }
 
-function isPresenceFresh(value, nowMs = Date.now()) {
-    if (!value) {
-        return false;
-    }
-
-    const timestamp = value instanceof Date ? value.getTime() : new Date(value).getTime();
-    return Number.isFinite(timestamp) && nowMs - timestamp <= ROOM_PRESENCE_TIMEOUT_SECONDS * 1000;
+function isPresenceAgeFresh(ageSeconds, timeoutSeconds = ROOM_PRESENCE_TIMEOUT_SECONDS) {
+    const age = Number(ageSeconds);
+    return Number.isFinite(age) && age >= 0 && age <= timeoutSeconds;
 }
 
 function buildPresenceResponse(room, slot) {
-    const opponentLastSeenAt = slot != null ? room?.[slot.opponentColumn] : null;
-    const opponentOnline = isPresenceFresh(opponentLastSeenAt);
+    const opponentAgeSeconds = slot != null ? room?.[slot.opponentAgeColumn] : null;
+    const opponentOnline = isPresenceAgeFresh(opponentAgeSeconds);
     return {
         success: true,
         status: room.room_status,
@@ -585,7 +594,7 @@ async function resolveWaitingTicketToBot(executor, ticketRow) {
     }
 
     const roomId = buildRoomId();
-    const matchedAt = new Date();
+    const matchedAt = "CURRENT_TIMESTAMP(3)";
 
     await insertRoom(
         executor,
@@ -608,9 +617,9 @@ async function resolveWaitingTicketToBot(executor, ticketRow) {
              opponent_nickname = ?,
              matched_word = ?,
              matched_word_bank = ?,
-             resolved_at = ?
+             resolved_at = CURRENT_TIMESTAMP(3)
          WHERE ticket_id = ?`,
-        [roomId, BOT_USER_ID, "机器人", matchedWord, ticketRow.word_bank, matchedAt, ticketRow.ticket_id]
+        [roomId, BOT_USER_ID, "机器人", matchedWord, ticketRow.word_bank, ticketRow.ticket_id]
     );
 
     return await loadTicket(executor, ticketRow.ticket_id, false);
@@ -647,7 +656,7 @@ async function matchWithHuman(executor, requesterUserId, wordBank) {
 
     const roomId = buildRoomId();
     const requesterTicketId = buildTicketId();
-    const matchedAt = new Date();
+    const matchedAt = "CURRENT_TIMESTAMP(3)";
     const requesterNickname = `玩家${requesterUserId}`;
     const candidateNickname = `玩家${candidate.user_id}`;
 
@@ -672,32 +681,31 @@ async function matchWithHuman(executor, requesterUserId, wordBank) {
              opponent_nickname = ?,
              matched_word = ?,
              matched_word_bank = ?,
-             resolved_at = ?
+             resolved_at = CURRENT_TIMESTAMP(3)
          WHERE ticket_id = ?`,
-        [roomId, requesterUserId, requesterNickname, matchedWord, matchedWordBank, matchedAt, candidate.ticket_id]
+        [roomId, requesterUserId, requesterNickname, matchedWord, matchedWordBank, candidate.ticket_id]
     );
 
     await executor.execute(
         `INSERT INTO matchmaking_ticket
             (ticket_id, user_id, word_bank, matched_word_bank, status, fallback_at, room_id, opponent_type,
              opponent_user_id, opponent_nickname, matched_word, resolved_at)
-         VALUES (?, ?, ?, ?, 'matched', ?, ?, 'human', ?, ?, ?, ?)`,
-        [requesterTicketId, requesterUserId, wordBank, matchedWordBank, matchedAt, roomId, candidate.user_id, candidateNickname, matchedWord, matchedAt]
+         VALUES (?, ?, ?, ?, 'matched', CURRENT_TIMESTAMP(3), ?, 'human', ?, ?, ?, CURRENT_TIMESTAMP(3))`,
+        [requesterTicketId, requesterUserId, wordBank, matchedWordBank, roomId, candidate.user_id, candidateNickname, matchedWord]
     );
 
     return await loadTicket(executor, requesterTicketId, false);
 }
 
 async function createWaitingTicket(executor, userId, wordBank, timeoutMs, allowBotFallback = true) {
-    const now = new Date();
-    const fallbackAt = addMilliseconds(now, timeoutMs);
     const ticketId = buildTicketId();
+    const timeoutMicroseconds = Math.max(1000, Math.round(timeoutMs * 1000));
 
     await executor.execute(
         `INSERT INTO matchmaking_ticket
             (ticket_id, user_id, word_bank, allow_bot_fallback, status, fallback_at)
-         VALUES (?, ?, ?, ?, 'waiting', ?)`,
-        [ticketId, userId, wordBank, allowBotFallback ? 1 : 0, fallbackAt]
+         VALUES (?, ?, ?, ?, 'waiting', CURRENT_TIMESTAMP(3) + INTERVAL ? MICROSECOND)`,
+        [ticketId, userId, wordBank, allowBotFallback ? 1 : 0, timeoutMicroseconds]
     );
 
     return await loadTicket(executor, ticketId, false);
@@ -718,8 +726,14 @@ async function resolveTicketIfExpired(ticketId) {
                 return ticket;
             }
 
-            const fallbackAt = ticket.fallback_at instanceof Date ? ticket.fallback_at.getTime() : new Date(ticket.fallback_at).getTime();
-            if (fallbackAt > Date.now()) {
+            const [expiryRows] = await connection.execute(
+                `SELECT CASE WHEN fallback_at <= CURRENT_TIMESTAMP(3) THEN 1 ELSE 0 END AS expired
+                 FROM matchmaking_ticket
+                 WHERE ticket_id = ?
+                 LIMIT 1`,
+                [ticketId]
+            );
+            if (Number(expiryRows[0]?.expired || 0) !== 1) {
                 await connection.commit();
                 return ticket;
             }
@@ -741,7 +755,7 @@ async function sweepExpiredWaitingTickets() {
         `SELECT ticket_id
          FROM matchmaking_ticket
          WHERE status = 'waiting'
-           AND fallback_at <= UTC_TIMESTAMP(3)
+           AND fallback_at <= CURRENT_TIMESTAMP(3)
          ORDER BY fallback_at ASC
          LIMIT 20`
     );
@@ -785,11 +799,15 @@ exports.enqueue = async (req, res) => {
                         existingWaiting.allow_bot_fallback = allowBotFallback ? 1 : 0;
                     }
 
-                    const fallbackAt = existingWaiting.fallback_at instanceof Date
-                        ? existingWaiting.fallback_at.getTime()
-                        : new Date(existingWaiting.fallback_at).getTime();
+                    const [expiryRows] = await connection.execute(
+                        `SELECT CASE WHEN fallback_at <= CURRENT_TIMESTAMP(3) THEN 1 ELSE 0 END AS expired
+                         FROM matchmaking_ticket
+                         WHERE ticket_id = ?
+                         LIMIT 1`,
+                        [existingWaiting.ticket_id]
+                    );
 
-                    if (fallbackAt <= Date.now() && existingWaiting.allow_bot_fallback !== 0 && existingWaiting.allow_bot_fallback !== false) {
+                    if (Number(expiryRows[0]?.expired || 0) === 1 && existingWaiting.allow_bot_fallback !== 0 && existingWaiting.allow_bot_fallback !== false) {
                         existingWaiting = await resolveWaitingTicketToBot(connection, existingWaiting);
                     }
 
@@ -919,7 +937,7 @@ exports.cancel = async (req, res) => {
                 await connection.execute(
                     `UPDATE matchmaking_ticket
                      SET status = 'cancelled',
-                         cancelled_at = UTC_TIMESTAMP(3)
+                         cancelled_at = CURRENT_TIMESTAMP(3)
                      WHERE ticket_id = ?`,
                     [ticketId]
                 );
@@ -995,8 +1013,8 @@ exports.rematch = async (req, res) => {
                 await connection.execute(
                     `UPDATE matchmaking_room
                      SET ${slot.selfRematchColumn} = ?,
-                         ${slot.selfColumn} = UTC_TIMESTAMP(3),
-                         rematch_requested_at = COALESCE(rematch_requested_at, UTC_TIMESTAMP(3))
+                         ${slot.selfColumn} = CURRENT_TIMESTAMP(3),
+                         rematch_requested_at = COALESCE(rematch_requested_at, CURRENT_TIMESTAMP(3))
                      WHERE room_id = ?`,
                     [previousRoundNo, roomId]
                 );
@@ -1019,7 +1037,7 @@ exports.rematch = async (req, res) => {
                              user1_rematch_round_no = 0,
                              user2_rematch_round_no = 0,
                              rematch_requested_at = NULL,
-                             matched_at = UTC_TIMESTAMP(3)
+                             matched_at = CURRENT_TIMESTAMP(3)
                          WHERE room_id = ?`,
                         [matchedWord, nextRoundNo, roomId]
                     );
@@ -1029,8 +1047,8 @@ exports.rematch = async (req, res) => {
                          SET matched_word = ?,
                              matched_word_bank = ?,
                              match_round_no = ?,
-                             updated_at = UTC_TIMESTAMP(3),
-                             resolved_at = UTC_TIMESTAMP(3)
+                             updated_at = CURRENT_TIMESTAMP(3),
+                             resolved_at = CURRENT_TIMESTAMP(3)
                          WHERE room_id = ? AND status = 'matched'`,
                         [matchedWord, updatedRoom.word_bank, nextRoundNo, roomId]
                     );
@@ -1046,7 +1064,7 @@ exports.rematch = async (req, res) => {
                 }
 
                 const [timeoutRows] = await connection.execute(
-                    `SELECT TIMESTAMPDIFF(SECOND, rematch_requested_at, UTC_TIMESTAMP(3)) AS wait_seconds
+                    `SELECT TIMESTAMPDIFF(SECOND, rematch_requested_at, CURRENT_TIMESTAMP(3)) AS wait_seconds
                      FROM matchmaking_room
                      WHERE room_id = ?
                        AND rematch_requested_at IS NOT NULL
@@ -1112,7 +1130,7 @@ exports.heartbeat = async (req, res) => {
 
                 await connection.execute(
                     `UPDATE matchmaking_room
-                     SET ${slot.selfColumn} = UTC_TIMESTAMP(3)
+                     SET ${slot.selfColumn} = CURRENT_TIMESTAMP(3)
                      WHERE room_id = ?`,
                     [roomId]
                 );
@@ -1168,7 +1186,7 @@ exports.resume = async (req, res) => {
                     return { statusCode: 409, body: { success: false, message: "房间已失效", status: room.room_status } };
                 }
 
-                if (!isPresenceFresh(room[slot.opponentColumn])) {
+                if (!isPresenceAgeFresh(room[slot.opponentAgeColumn], ROOM_RESUME_GRACE_SECONDS)) {
                     await abandonMatchedRoom(connection, roomId, slot.selfColumn);
                     await connection.commit();
                     return { statusCode: 409, body: { success: false, message: "对方已不在房间中，房间已失效", status: "abandoned" } };
@@ -1176,7 +1194,7 @@ exports.resume = async (req, res) => {
 
                 await connection.execute(
                     `UPDATE matchmaking_room
-                     SET ${slot.selfColumn} = UTC_TIMESTAMP(3)
+                     SET ${slot.selfColumn} = CURRENT_TIMESTAMP(3)
                      WHERE room_id = ?`,
                     [roomId]
                 );

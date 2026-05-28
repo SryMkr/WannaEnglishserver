@@ -13,17 +13,14 @@ exports.saveDailySummary = async (req, res) => {
             return res.status(400).json({ error: "Invalid gameModeID" });
         }
 
-        const today = new Date().toISOString().slice(0, 10);
-        const nowUTC = new Date().toISOString().slice(0, 19).replace("T", " ");
-
         await db.execute(
             `INSERT INTO user_daily_summary
              (user_id, game_mode_id, game_date, entry_count, first_enter_at)
-             VALUES (?, ?, ?, 1, ?)
+             VALUES (?, ?, CURRENT_DATE(), 1, CURRENT_TIMESTAMP)
              ON DUPLICATE KEY UPDATE
                  entry_count = entry_count + 1,
                  first_enter_at = COALESCE(first_enter_at, VALUES(first_enter_at))`,
-            [userID, numericGameModeID, today, nowUTC]
+            [userID, numericGameModeID]
         );
 
         return res.json({ success: true });

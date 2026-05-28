@@ -4,13 +4,13 @@ async function abandonMatchedRoom(executor, roomId, selfLastSeenColumn = null) {
     }
 
     const lastSeenAssignment = selfLastSeenColumn
-        ? `,\n             ${selfLastSeenColumn} = UTC_TIMESTAMP(3)`
+        ? `,\n             ${selfLastSeenColumn} = CURRENT_TIMESTAMP(3)`
         : "";
 
     await executor.execute(
         `UPDATE matchmaking_room
          SET room_status = 'abandoned',
-             finished_at = COALESCE(finished_at, UTC_TIMESTAMP(3))${lastSeenAssignment}
+             finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP(3))${lastSeenAssignment}
          WHERE room_id = ? AND room_status = 'matched'`,
         [roomId]
     );
@@ -18,7 +18,7 @@ async function abandonMatchedRoom(executor, roomId, selfLastSeenColumn = null) {
     await executor.execute(
         `UPDATE matchmaking_ticket
          SET status = 'cancelled',
-             cancelled_at = COALESCE(cancelled_at, UTC_TIMESTAMP(3))
+             cancelled_at = COALESCE(cancelled_at, CURRENT_TIMESTAMP(3))
          WHERE room_id = ? AND status = 'matched'`,
         [roomId]
     );

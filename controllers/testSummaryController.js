@@ -31,7 +31,6 @@ exports.saveTestSummary = async (req, res) => {
             return res.status(400).json({ error: `Unknown testType: ${testType}` });
         }
 
-        const today = new Date().toISOString().slice(0, 10);
         const correct = result === "correct" ? 1 : 0;
         const wrong = result === "wrong" ? 1 : 0;
         const skip = result === "skip" ? 1 : 0;
@@ -42,7 +41,7 @@ exports.saveTestSummary = async (req, res) => {
              (user_id, word_id, test_type_code, game_date,
               correct_count, wrong_count, skip_count,
               avg_response_t, last_result)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, CURRENT_DATE(), ?, ?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE
                 avg_response_t = ROUND(
                     (
@@ -59,7 +58,6 @@ exports.saveTestSummary = async (req, res) => {
                 userID,
                 wordID,
                 testTypeCode,
-                today,
                 correct,
                 wrong,
                 skip,

@@ -75,7 +75,7 @@ async function main() {
         `INSERT INTO user_study_session_summary
           (user1_id, user2_id, word_id, play_mode, match_room_id, actual_word_bank,
            player1_card, player2_card, first_player, winner_user_id, duration, game_status, played_at)
-         VALUES (?, ?, ?, 'match_human', ?, ?, 'seed-a', 'seed-b', ?, ?, ?, 1, UTC_TIMESTAMP() - INTERVAL ? DAY)`,
+         VALUES (?, ?, ?, 'match_human', ?, ?, 'seed-a', 'seed-b', ?, ?, ?, 1, CURRENT_TIMESTAMP - INTERVAL ? DAY)`,
         [
           winnerId,
           loserId,

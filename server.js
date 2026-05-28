@@ -6,6 +6,7 @@ const util = require('util');
 const path = require('path');
 const matchmakingController = require("./controllers/matchmakingController");
 const friendRoomController = require("./controllers/friendRoomController");
+const { formatChinaIsoDateTime } = require("./services/timeService");
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
@@ -51,15 +52,15 @@ app.use((req, res, next) => {
     const startTime = Date.now();
     const payload = req.method === "GET" ? req.query : req.body;
 
-    console.log(
-        `[${new Date().toISOString()}] -> ${req.method} ${req.originalUrl} payload=${summarizePayload(payload)}`
-    );
+	    console.log(
+	        `[${formatChinaIsoDateTime()}] -> ${req.method} ${req.originalUrl} payload=${summarizePayload(payload)}`
+	    );
 
     res.on("finish", () => {
         const duration = Date.now() - startTime;
-        console.log(
-            `[${new Date().toISOString()}] <- ${req.method} ${req.originalUrl} status=${res.statusCode} duration=${duration}ms`
-        );
+	        console.log(
+	            `[${formatChinaIsoDateTime()}] <- ${req.method} ${req.originalUrl} status=${res.statusCode} duration=${duration}ms`
+	        );
     });
 
     next();
@@ -91,10 +92,10 @@ app.use("/action-log", require("./routes/actionLogRoutes"));
 app.use('/weChat', require('./routes/wechatRoutes'));
 
 app.use((err, req, res, next) => {
-    console.error(
-        `[${new Date().toISOString()}] !! ${req.method} ${req.originalUrl} unhandled error:`,
-        err
-    );
+	    console.error(
+	        `[${formatChinaIsoDateTime()}] !! ${req.method} ${req.originalUrl} unhandled error:`,
+	        err
+	    );
 
     if (res.headersSent) {
         return next(err);

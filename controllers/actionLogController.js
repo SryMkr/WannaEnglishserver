@@ -1,34 +1,19 @@
 const db = require("../config/db");
+const {
+    formatChinaDateTime,
+    formatChinaIsoDateTime,
+    normalizeToChinaDateTime
+} = require("../services/timeService");
 
 // -------------------------------
-// 处理 Unity ISO8601 时间 → MySQL DATETIME(6)
+// 处理 Unity 时间 → 中国时区 MySQL DATETIME(6)
 // -------------------------------
 function fixTimestamp(ts) {
-    if (!ts) return null;
-
-    if (typeof ts !== "string") {
-        return null;
-    }
-
-    // 去掉末尾的 Z
-    ts = ts.replace("Z", "");
-
-    // 提取小数秒部分
-    const match = ts.match(/\.(\d+)/);
-
-    if (match) {
-        // 只保留 6 位微秒
-        let micro = match[1].substring(0, 6);
-
-        ts = ts.replace(/\.\d+/, "." + micro);
-    }
-
-    return ts.replace("T", " "); // MySQL 时间格式：YYYY-MM-DD HH:MM:SS.ffffff
+    return normalizeToChinaDateTime(ts, 6);
 }
 
-function getCurrentUtcDateTime6() {
-    const iso = new Date().toISOString().replace("Z", "");
-    return `${iso.replace("T", " ")}000`;
+function getCurrentChinaDateTime6() {
+    return formatChinaDateTime(new Date(), 6);
 }
 
 // -------------------------------
@@ -111,7 +96,7 @@ exports.batchInsertActionLogs = async (req, res) => {
                 numericRoundNo,
                 JSON.stringify(action_detail ?? {}),
                 context_state == null ? null : JSON.stringify(context_state),
-                fixTimestamp(action_timestamp) || getCurrentUtcDateTime6()
+                fixTimestamp(action_timestamp) || getCurrentChinaDateTime6()
             ]);
         }
 
@@ -196,7 +181,7 @@ exports.getRoomActionLogs = async (req, res) => {
                 round_no: Number(row.round_no),
                 action_detail_json: row.action_detail_json || "{}",
                 context_state_json: row.context_state_json || "",
-                created_at: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at
+                created_at: row.created_at instanceof Date ? formatChinaIsoDateTime(row.created_at, 6) : row.created_at
             })),
             next_after_id: rows.length > 0 ? Number(rows[rows.length - 1].action_log_id) : afterId
         });

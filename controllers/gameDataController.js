@@ -70,17 +70,15 @@ exports.saveGameData = async (req, res) => {
             return res.status(400).json({ error: `Unknown role: ${role}` });
         }
 
-        const nowUTC = new Date().toISOString().slice(0, 19).replace('T', ' ');
-
         await db.execute(`
             INSERT INTO user_game_data
             (user_id, register_at, language_level_code, pet_code, role_code)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 language_level_code = VALUES(language_level_code),
                 pet_code = VALUES(pet_code),
                 role_code = VALUES(role_code)
-        `, [userID, nowUTC, wordCode, petCode, roleCode]);
+        `, [userID, wordCode, petCode, roleCode]);
 
         res.json({ success: true });
 

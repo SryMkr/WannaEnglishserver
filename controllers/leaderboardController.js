@@ -51,7 +51,7 @@ function buildWindowClause(period) {
     }
 
     return {
-        sql: "AND s.played_at >= UTC_DATE() - INTERVAL WEEKDAY(UTC_DATE()) DAY",
+        sql: "AND s.played_at >= CURRENT_DATE() - INTERVAL WEEKDAY(CURRENT_DATE()) DAY",
         params: []
     };
 }

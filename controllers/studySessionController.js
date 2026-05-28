@@ -1,6 +1,7 @@
 const db = require("../config/db");
 const { getWordId } = require("../services/lookupCache");
 const { getWordBankLevelCode, normalizeWordBank } = require("../services/wordBankService");
+const { addDaysToDateString, formatChinaDate } = require("../services/timeService");
 
 function parseJsonField(value, fallback) {
     if (value == null) {
@@ -27,11 +28,11 @@ function normalizeUserId(value) {
     return Number.isInteger(userId) && userId > 0 ? userId : null;
 }
 
-function formatUtcDate(date) {
-    return date.toISOString().slice(0, 10);
+function formatStudyDate(date) {
+    return formatChinaDate(date);
 }
 
-function buildUtcDateSet(rows) {
+function buildStudyDateSet(rows) {
     const dates = new Set();
     for (const row of rows) {
         if (row == null || row.study_date == null) {
@@ -39,7 +40,7 @@ function buildUtcDateSet(rows) {
         }
 
         if (row.study_date instanceof Date) {
-            dates.add(formatUtcDate(row.study_date));
+            dates.add(formatStudyDate(row.study_date));
         } else {
             dates.add(String(row.study_date).slice(0, 10));
         }
@@ -49,13 +50,13 @@ function buildUtcDateSet(rows) {
 }
 
 function calculateStreakDays(rows) {
-    const dateSet = buildUtcDateSet(rows);
-    let cursor = new Date();
+    const dateSet = buildStudyDateSet(rows);
+    let cursor = formatChinaDate();
     let streak = 0;
 
-    while (dateSet.has(formatUtcDate(cursor))) {
+    while (cursor && dateSet.has(cursor)) {
         streak += 1;
-        cursor.setUTCDate(cursor.getUTCDate() - 1);
+        cursor = addDaysToDateString(cursor, -1);
     }
 
     return streak;
@@ -451,7 +452,7 @@ exports.getStudyStatsOverview = async (req, res) => {
         const [wordRows] = await db.execute(
             `SELECT
                  COUNT(*) AS total_learned_words,
-                 SUM(CASE WHEN DATE(last_studied_at) = UTC_DATE() THEN 1 ELSE 0 END) AS today_learned_words
+                 SUM(CASE WHEN DATE(last_studied_at) = CURRENT_DATE() THEN 1 ELSE 0 END) AS today_learned_words
              FROM user_word_progress
              WHERE user_id = ?`,
             [userId]

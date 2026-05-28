@@ -7,6 +7,7 @@ const {
 const {
     abandonMatchedRoom
 } = require("../services/matchRoomLifecycleService");
+const { formatChinaIsoDateTime } = require("../services/timeService");
 
 const ROOM_TTL_MINUTES = Math.max(5, Number(process.env.FRIEND_ROOM_TTL_MINUTES) || 30);
 
@@ -35,17 +36,13 @@ function buildRoomCode() {
     return String(crypto.randomInt(0, 1000000)).padStart(6, "0");
 }
 
-function addMinutes(date, minutes) {
-    return new Date(date.getTime() + minutes * 60 * 1000);
-}
-
 function toIsoString(value) {
     if (!value) {
         return null;
     }
 
     const date = value instanceof Date ? value : new Date(value);
-    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+    return Number.isNaN(date.getTime()) ? null : formatChinaIsoDateTime(date, 3);
 }
 
 function buildPlayer(userId, nickname, avatarUrl, ready) {
@@ -236,8 +233,14 @@ async function expireRoomIfNeeded(executor, room) {
         return room;
     }
 
-    const expiresAt = room.expires_at instanceof Date ? room.expires_at.getTime() : new Date(room.expires_at).getTime();
-    if (expiresAt > Date.now()) {
+    const [rows] = await executor.execute(
+        `SELECT CASE WHEN expires_at <= CURRENT_TIMESTAMP(3) THEN 1 ELSE 0 END AS expired
+         FROM friend_room
+         WHERE invite_id = ?
+         LIMIT 1`,
+        [room.invite_id]
+    );
+    if (Number(rows[0]?.expired || 0) !== 1) {
         return room;
     }
 
@@ -255,10 +258,10 @@ async function syncMatchedRoomState(executor, room, lockMatchRoom = false) {
 
     const lockClause = lockMatchRoom ? " FOR UPDATE" : "";
     const [rows] = await executor.execute(
-        `SELECT room_status
-         FROM matchmaking_room
-         WHERE room_id = ?${lockClause}
-         LIMIT 1`,
+	         `SELECT room_status
+	         FROM matchmaking_room
+	         WHERE room_id = ?
+	         LIMIT 1${lockClause}`,
         [room.match_room_id]
     );
 
@@ -348,7 +351,6 @@ async function finalizeMatchIfReady(executor, room) {
     const roomId = buildRoomId();
     const hostTicketId = buildTicketId();
     const guestTicketId = buildTicketId();
-    const matchedAt = new Date();
     const hostNickname = room.host_nickname || `玩家${room.host_user_id}`;
     const guestNickname = room.guest_nickname || `玩家${room.guest_user_id}`;
 
@@ -356,8 +358,8 @@ async function finalizeMatchIfReady(executor, room) {
         `INSERT INTO matchmaking_room
             (room_id, room_status, word_bank, matched_word, match_round_no, opponent_type, user1_id, user2_id,
              user1_last_seen_at, user2_last_seen_at, matched_at)
-         VALUES (?, 'matched', ?, ?, 1, 'human', ?, ?, ?, ?, ?)`,
-        [roomId, room.word_bank, matchedWord, room.host_user_id, room.guest_user_id, matchedAt, matchedAt, matchedAt]
+         VALUES (?, 'matched', ?, ?, 1, 'human', ?, ?, CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3))`,
+        [roomId, room.word_bank, matchedWord, room.host_user_id, room.guest_user_id]
     );
 
     await executor.execute(
@@ -365,11 +367,11 @@ async function finalizeMatchIfReady(executor, room) {
             (ticket_id, user_id, word_bank, matched_word_bank, allow_bot_fallback, status, fallback_at,
              room_id, opponent_type, opponent_user_id, opponent_nickname, matched_word, match_round_no, resolved_at)
          VALUES
-            (?, ?, ?, ?, 0, 'matched', ?, ?, 'human', ?, ?, ?, 1, ?),
-            (?, ?, ?, ?, 0, 'matched', ?, ?, 'human', ?, ?, ?, 1, ?)`,
+            (?, ?, ?, ?, 0, 'matched', CURRENT_TIMESTAMP(3), ?, 'human', ?, ?, ?, 1, CURRENT_TIMESTAMP(3)),
+            (?, ?, ?, ?, 0, 'matched', CURRENT_TIMESTAMP(3), ?, 'human', ?, ?, ?, 1, CURRENT_TIMESTAMP(3))`,
         [
-            hostTicketId, room.host_user_id, room.word_bank, room.word_bank, matchedAt, roomId, room.guest_user_id, guestNickname, matchedWord, matchedAt,
-            guestTicketId, room.guest_user_id, room.word_bank, room.word_bank, matchedAt, roomId, room.host_user_id, hostNickname, matchedWord, matchedAt
+            hostTicketId, room.host_user_id, room.word_bank, room.word_bank, roomId, room.guest_user_id, guestNickname, matchedWord,
+            guestTicketId, room.guest_user_id, room.word_bank, room.word_bank, roomId, room.host_user_id, hostNickname, matchedWord
         ]
     );
 
@@ -402,13 +404,12 @@ async function create(req, res) {
         const result = await withConnection(async connection => {
             const roomCode = await buildUniqueRoomCode(connection);
             const inviteId = buildInviteId();
-            const now = new Date();
 
             await connection.execute(
                 `INSERT INTO friend_room
                     (invite_id, room_code, host_user_id, word_bank, language_level_code, status, expires_at)
-                 VALUES (?, ?, ?, ?, ?, 'waiting', ?)`,
-                [inviteId, roomCode, hostUserId, wordBank, languageLevelCode, addMinutes(now, ROOM_TTL_MINUTES)]
+                 VALUES (?, ?, ?, ?, ?, 'waiting', CURRENT_TIMESTAMP(3) + INTERVAL ? MINUTE)`,
+                [inviteId, roomCode, hostUserId, wordBank, languageLevelCode, ROOM_TTL_MINUTES]
             );
 
             return await loadRoomByInviteOrCode(connection, { inviteId }, false);

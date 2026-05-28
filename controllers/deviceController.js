@@ -49,7 +49,7 @@ exports.uploadDeviceInfo = async (req, res) => {
                 sdk_version = VALUES(sdk_version),
                 latitude = VALUES(latitude),
                 longitude = VALUES(longitude),
-                collected_at = UTC_TIMESTAMP()`,
+                collected_at = CURRENT_TIMESTAMP`,
             [
                 user_id,
                 model,
