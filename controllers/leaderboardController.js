@@ -102,6 +102,7 @@ function toLeaderboardRow(row) {
         rank: Number(row.rank_position || 0),
         user_id: Number(row.user_id || 0),
         display_name: row.display_name || buildDisplayName(row.user_id),
+        avatar_url: row.avatar_url || "",
         wins,
         matches,
         win_rate: Number(winRate.toFixed(4)),
@@ -122,7 +123,9 @@ async function queryLeaderboard(period, wordBankFilter, currentWordBank, userId)
             s.duration,
             s.played_at,
             up1.wechat_nickname AS user1_nickname,
-            up2.wechat_nickname AS user2_nickname
+            up1.avatar_url AS user1_avatar_url,
+            up2.wechat_nickname AS user2_nickname,
+            up2.avatar_url AS user2_avatar_url
         FROM user_study_session_summary s
         LEFT JOIN matchmaking_ticket mt ON mt.room_id = s.match_room_id
         LEFT JOIN user_profile up1 ON up1.user_id = s.user1_id
@@ -135,7 +138,7 @@ async function queryLeaderboard(period, wordBankFilter, currentWordBank, userId)
     const seenMatchKeys = new Set();
     const statsByUserId = new Map();
 
-    function ensureStats(participantUserId, displayName) {
+    function ensureStats(participantUserId, displayName, avatarUrl) {
         const numericUserId = Number(participantUserId || 0);
         if (numericUserId <= 0) {
             return null;
@@ -145,6 +148,7 @@ async function queryLeaderboard(period, wordBankFilter, currentWordBank, userId)
             statsByUserId.set(numericUserId, {
                 user_id: numericUserId,
                 display_name: displayName || buildDisplayName(numericUserId),
+                avatar_url: avatarUrl || "",
                 wins: 0,
                 matches: 0,
                 duration_total: 0,
@@ -163,12 +167,12 @@ async function queryLeaderboard(period, wordBankFilter, currentWordBank, userId)
         seenMatchKeys.add(matchKey);
 
         const participants = [
-            { userId: session.user1_id, nickname: session.user1_nickname },
-            { userId: session.user2_id, nickname: session.user2_nickname }
+            { userId: session.user1_id, nickname: session.user1_nickname, avatarUrl: session.user1_avatar_url },
+            { userId: session.user2_id, nickname: session.user2_nickname, avatarUrl: session.user2_avatar_url }
         ];
 
         for (const participant of participants) {
-            const stats = ensureStats(participant.userId, participant.nickname);
+            const stats = ensureStats(participant.userId, participant.nickname, participant.avatarUrl);
             if (!stats) {
                 continue;
             }
@@ -189,6 +193,7 @@ async function queryLeaderboard(period, wordBankFilter, currentWordBank, userId)
             rank_position: 0,
             user_id: stats.user_id,
             display_name: stats.display_name,
+            avatar_url: stats.avatar_url,
             wins: stats.wins,
             matches: stats.matches,
             avg_duration: stats.duration_count > 0 ? stats.duration_total / stats.duration_count : null
