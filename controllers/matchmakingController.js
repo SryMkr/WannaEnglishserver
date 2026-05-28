@@ -9,6 +9,7 @@ const DEFAULT_MATCH_TIMEOUT_MS = Math.max(1000, Number(process.env.MATCH_TIMEOUT
 const BOT_USER_ID = Number(process.env.MATCH_BOT_USER_ID) || 1002;
 const BOT_OPEN_ID = process.env.MATCH_BOT_OPEN_ID || `system-bot-${BOT_USER_ID}`;
 const ROOM_PRESENCE_TIMEOUT_SECONDS = Math.max(5, Number(process.env.MATCH_ROOM_PRESENCE_TIMEOUT_SECONDS) || 12);
+const REMATCH_WAIT_TIMEOUT_SECONDS = Math.max(5, Number(process.env.MATCH_REMATCH_WAIT_TIMEOUT_SECONDS) || 20);
 
 let ticketSequence = 0;
 let roomSequence = 0;
@@ -112,6 +113,27 @@ function buildWaitingResponse(row, now = Date.now()) {
     };
 }
 
+function buildRematchWaitingResponse(room, slot) {
+    return {
+        success: true,
+        status: "waiting",
+        ticket_id: null,
+        room_id: room.room_id,
+        opponent_type: room.opponent_type,
+        word: null,
+        matched_word_bank: room.word_bank,
+        match_round_no: Number(room.match_round_no || 1),
+        opponent: {
+            user_id: slot != null ? Number(slot.opponentUserId || 0) : 0,
+            is_bot: false,
+            nickname: slot != null && slot.opponentUserId > 0 ? `玩家${slot.opponentUserId}` : "对手"
+        },
+        fallback_at: null,
+        wait_seconds: REMATCH_WAIT_TIMEOUT_SECONDS,
+        message: "等待对方确认再来一局"
+    };
+}
+
 function buildMatchedResponse(row) {
     return {
         success: true,
@@ -186,6 +208,9 @@ async function initializeMatchmakingSchema() {
                 user2_id BIGINT NULL,
                 user1_last_seen_at DATETIME(3) NULL,
                 user2_last_seen_at DATETIME(3) NULL,
+                user1_rematch_round_no INT NOT NULL DEFAULT 0,
+                user2_rematch_round_no INT NOT NULL DEFAULT 0,
+                rematch_requested_at DATETIME(3) NULL,
                 created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
                 matched_at DATETIME(3) NOT NULL,
                 finished_at DATETIME(3) NULL,
@@ -242,6 +267,24 @@ async function initializeMatchmakingSchema() {
             "matchmaking_room",
             "user2_last_seen_at",
             "user2_last_seen_at DATETIME(3) NULL AFTER user1_last_seen_at"
+        );
+        await ensureColumn(
+            db,
+            "matchmaking_room",
+            "user1_rematch_round_no",
+            "user1_rematch_round_no INT NOT NULL DEFAULT 0 AFTER user2_last_seen_at"
+        );
+        await ensureColumn(
+            db,
+            "matchmaking_room",
+            "user2_rematch_round_no",
+            "user2_rematch_round_no INT NOT NULL DEFAULT 0 AFTER user1_rematch_round_no"
+        );
+        await ensureColumn(
+            db,
+            "matchmaking_room",
+            "rematch_requested_at",
+            "rematch_requested_at DATETIME(3) NULL AFTER user2_rematch_round_no"
         );
         await ensureColumn(
             db,
@@ -443,7 +486,8 @@ async function loadRoomById(executor, roomId, lockRow = false) {
     const lockClause = lockRow ? " FOR UPDATE" : "";
     const [rows] = await executor.execute(
         `SELECT room_id, room_status, word_bank, matched_word, match_round_no,
-                opponent_type, user1_id, user2_id, user1_last_seen_at, user2_last_seen_at, matched_at
+                opponent_type, user1_id, user2_id, user1_last_seen_at, user2_last_seen_at,
+                user1_rematch_round_no, user2_rematch_round_no, rematch_requested_at, matched_at
          FROM matchmaking_room
          WHERE room_id = ?${lockClause}`,
         [roomId]
@@ -461,6 +505,8 @@ function resolveRoomUserSlot(room, userId) {
         return {
             selfColumn: "user1_last_seen_at",
             opponentColumn: "user2_last_seen_at",
+            selfRematchColumn: "user1_rematch_round_no",
+            opponentRematchColumn: "user2_rematch_round_no",
             opponentUserId: Number(room.user2_id || 0)
         };
     }
@@ -469,6 +515,8 @@ function resolveRoomUserSlot(room, userId) {
         return {
             selfColumn: "user2_last_seen_at",
             opponentColumn: "user1_last_seen_at",
+            selfRematchColumn: "user2_rematch_round_no",
+            opponentRematchColumn: "user1_rematch_round_no",
             opponentUserId: Number(room.user1_id || 0)
         };
     }
@@ -905,10 +953,40 @@ exports.rematch = async (req, res) => {
                     return { statusCode: 403, body: { success: false, message: "你不在这个房间中" } };
                 }
 
+                const slot = resolveRoomUserSlot(room, userId);
+                if (!slot) {
+                    await connection.rollback();
+                    return { statusCode: 403, body: { success: false, message: "你不在这个房间中" } };
+                }
+
                 const currentRoundNo = Math.max(1, Number(room.match_round_no || 1));
-                if (currentRoundNo <= previousRoundNo) {
+                if (previousRoundNo < currentRoundNo) {
+                    const ticket = await loadMatchedTicketByRoomAndUser(connection, roomId, userId);
+                    if (!ticket) {
+                        await connection.rollback();
+                        return { statusCode: 404, body: { success: false, message: "房间匹配票据不存在" } };
+                    }
+
+                    await connection.commit();
+                    return { statusCode: 200, body: buildMatchedResponse(ticket) };
+                }
+
+                await connection.execute(
+                    `UPDATE matchmaking_room
+                     SET ${slot.selfRematchColumn} = ?,
+                         ${slot.selfColumn} = UTC_TIMESTAMP(3),
+                         rematch_requested_at = COALESCE(rematch_requested_at, UTC_TIMESTAMP(3))
+                     WHERE room_id = ?`,
+                    [previousRoundNo, roomId]
+                );
+
+                const updatedRoom = await loadRoomById(connection, roomId, true);
+                const selfReadyRoundNo = Math.max(0, Number(updatedRoom[slot.selfRematchColumn] || 0));
+                const opponentReadyRoundNo = Math.max(0, Number(updatedRoom[slot.opponentRematchColumn] || 0));
+
+                if (selfReadyRoundNo >= previousRoundNo && opponentReadyRoundNo >= previousRoundNo) {
                     const nextRoundNo = previousRoundNo + 1;
-                    const matchedWord = await pickWord(room.word_bank, connection);
+                    const matchedWord = await pickWord(updatedRoom.word_bank, connection);
                     if (!matchedWord) {
                         throw new Error("No match word available");
                     }
@@ -917,6 +995,9 @@ exports.rematch = async (req, res) => {
                         `UPDATE matchmaking_room
                          SET matched_word = ?,
                              match_round_no = ?,
+                             user1_rematch_round_no = 0,
+                             user2_rematch_round_no = 0,
+                             rematch_requested_at = NULL,
                              matched_at = UTC_TIMESTAMP(3)
                          WHERE room_id = ?`,
                         [matchedWord, nextRoundNo, roomId]
@@ -930,18 +1011,35 @@ exports.rematch = async (req, res) => {
                              updated_at = UTC_TIMESTAMP(3),
                              resolved_at = UTC_TIMESTAMP(3)
                          WHERE room_id = ? AND status = 'matched'`,
-                        [matchedWord, room.word_bank, nextRoundNo, roomId]
+                        [matchedWord, updatedRoom.word_bank, nextRoundNo, roomId]
+                    );
+
+                    const ticket = await loadMatchedTicketByRoomAndUser(connection, roomId, userId);
+                    if (!ticket) {
+                        await connection.rollback();
+                        return { statusCode: 404, body: { success: false, message: "房间匹配票据不存在" } };
+                    }
+
+                    await connection.commit();
+                    return { statusCode: 200, body: buildMatchedResponse(ticket) };
+                }
+
+                const requestedAt = updatedRoom.rematch_requested_at instanceof Date
+                    ? updatedRoom.rematch_requested_at.getTime()
+                    : new Date(updatedRoom.rematch_requested_at).getTime();
+                if (Number.isFinite(requestedAt) && Date.now() - requestedAt > REMATCH_WAIT_TIMEOUT_SECONDS * 1000) {
+                    await connection.execute(
+                        `UPDATE matchmaking_room
+                         SET user1_rematch_round_no = 0,
+                             user2_rematch_round_no = 0,
+                             rematch_requested_at = NULL
+                         WHERE room_id = ?`,
+                        [roomId]
                     );
                 }
 
-                const ticket = await loadMatchedTicketByRoomAndUser(connection, roomId, userId);
-                if (!ticket) {
-                    await connection.rollback();
-                    return { statusCode: 404, body: { success: false, message: "房间匹配票据不存在" } };
-                }
-
                 await connection.commit();
-                return { statusCode: 200, body: buildMatchedResponse(ticket) };
+                return { statusCode: 200, body: buildRematchWaitingResponse(updatedRoom, slot) };
             } catch (error) {
                 await connection.rollback();
                 throw error;

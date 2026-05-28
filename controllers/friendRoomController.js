@@ -88,6 +88,7 @@ function buildMatchResponse(row, currentUserId) {
         opponent_type: "human",
         word: row.matched_word,
         matched_word_bank: row.word_bank,
+        match_round_no: Number(row.match_round_no || 1),
         language_level_code: Number(row.language_level_code || 0),
         opponent: buildOpponent(row, currentUserId),
         fallback_at: null,
@@ -152,6 +153,7 @@ async function initializeFriendRoomSchema() {
                 guest_ready TINYINT(1) NOT NULL DEFAULT 0,
                 status VARCHAR(16) NOT NULL DEFAULT 'waiting',
                 match_room_id VARCHAR(64) NULL,
+                match_round_no INT NOT NULL DEFAULT 1,
                 host_ticket_id VARCHAR(64) NULL,
                 guest_ticket_id VARCHAR(64) NULL,
                 matched_word VARCHAR(64) NULL,
@@ -168,6 +170,7 @@ async function initializeFriendRoomSchema() {
         );
 
         await ensureColumn(db, "friend_room", "host_ticket_id", "host_ticket_id VARCHAR(64) NULL AFTER match_room_id");
+        await ensureColumn(db, "friend_room", "match_round_no", "match_round_no INT NOT NULL DEFAULT 1 AFTER match_room_id");
         await ensureColumn(db, "friend_room", "guest_ticket_id", "guest_ticket_id VARCHAR(64) NULL AFTER host_ticket_id");
         await ensureColumn(db, "friend_room", "matched_word", "matched_word VARCHAR(64) NULL AFTER guest_ticket_id");
     })().catch(error => {
@@ -318,18 +321,19 @@ async function finalizeMatchIfReady(executor, room) {
 
     await executor.execute(
         `INSERT INTO matchmaking_room
-            (room_id, room_status, word_bank, matched_word, opponent_type, user1_id, user2_id, matched_at)
-         VALUES (?, 'matched', ?, ?, 'human', ?, ?, ?)`,
-        [roomId, room.word_bank, matchedWord, room.host_user_id, room.guest_user_id, matchedAt]
+            (room_id, room_status, word_bank, matched_word, match_round_no, opponent_type, user1_id, user2_id,
+             user1_last_seen_at, user2_last_seen_at, matched_at)
+         VALUES (?, 'matched', ?, ?, 1, 'human', ?, ?, ?, ?, ?)`,
+        [roomId, room.word_bank, matchedWord, room.host_user_id, room.guest_user_id, matchedAt, matchedAt, matchedAt]
     );
 
     await executor.execute(
         `INSERT INTO matchmaking_ticket
             (ticket_id, user_id, word_bank, matched_word_bank, allow_bot_fallback, status, fallback_at,
-             room_id, opponent_type, opponent_user_id, opponent_nickname, matched_word, resolved_at)
+             room_id, opponent_type, opponent_user_id, opponent_nickname, matched_word, match_round_no, resolved_at)
          VALUES
-            (?, ?, ?, ?, 0, 'matched', ?, ?, 'human', ?, ?, ?, ?),
-            (?, ?, ?, ?, 0, 'matched', ?, ?, 'human', ?, ?, ?, ?)`,
+            (?, ?, ?, ?, 0, 'matched', ?, ?, 'human', ?, ?, ?, 1, ?),
+            (?, ?, ?, ?, 0, 'matched', ?, ?, 'human', ?, ?, ?, 1, ?)`,
         [
             hostTicketId, room.host_user_id, room.word_bank, room.word_bank, matchedAt, roomId, room.guest_user_id, guestNickname, matchedWord, matchedAt,
             guestTicketId, room.guest_user_id, room.word_bank, room.word_bank, matchedAt, roomId, room.host_user_id, hostNickname, matchedWord, matchedAt
@@ -338,11 +342,12 @@ async function finalizeMatchIfReady(executor, room) {
 
     await executor.execute(
         `UPDATE friend_room
-         SET status = 'matched',
-             match_room_id = ?,
-             host_ticket_id = ?,
-             guest_ticket_id = ?,
-             matched_word = ?
+             SET status = 'matched',
+                 match_room_id = ?,
+                 match_round_no = 1,
+                 host_ticket_id = ?,
+                 guest_ticket_id = ?,
+                 matched_word = ?
          WHERE invite_id = ? AND status = 'joined'`,
         [roomId, hostTicketId, guestTicketId, matchedWord, room.invite_id]
     );
