@@ -314,6 +314,7 @@ exports.createStudySession = async (req, res) => {
             play_mode,
             match_ticket_id,
             match_room_id,
+            match_round_no,
             matchmaking_opponent_user_id,
             matchmaking_opponent_type,
             matchmaking_opponent_name,
@@ -329,11 +330,13 @@ exports.createStudySession = async (req, res) => {
             return res.status(400).json({ error: "Unknown word: " + word });
         }
 
+        const normalizedMatchRoundNo = Math.max(1, Number(match_round_no) || 1);
+
         const [result] = await db.query(
             `INSERT INTO user_study_session_summary 
                 (user1_id, user2_id, word_id, play_mode, match_ticket_id, match_room_id,
-                 matchmaking_opponent_user_id, matchmaking_opponent_type, matchmaking_opponent_name, actual_word_bank)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 match_round_no, matchmaking_opponent_user_id, matchmaking_opponent_type, matchmaking_opponent_name, actual_word_bank)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 user1_id,
                 user2_id,
@@ -341,6 +344,7 @@ exports.createStudySession = async (req, res) => {
                 play_mode ?? null,
                 match_ticket_id ?? null,
                 match_room_id ?? null,
+                normalizedMatchRoundNo,
                 matchmaking_opponent_user_id ?? null,
                 matchmaking_opponent_type ?? null,
                 matchmaking_opponent_name ?? null,

@@ -120,6 +120,7 @@ function buildMatchedResponse(row) {
         opponent_type: row.opponent_type,
         word: row.matched_word,
         matched_word_bank: row.matched_word_bank,
+        match_round_no: Number(row.match_round_no || 1),
         opponent: buildOpponent(row),
         fallback_at: null,
         wait_seconds: 0
@@ -178,6 +179,7 @@ async function initializeMatchmakingSchema() {
                 room_status VARCHAR(16) NOT NULL DEFAULT 'matched',
                 word_bank VARCHAR(32) NULL,
                 matched_word VARCHAR(64) NOT NULL,
+                match_round_no INT NOT NULL DEFAULT 1,
                 opponent_type VARCHAR(16) NOT NULL,
                 user1_id BIGINT NOT NULL,
                 user2_id BIGINT NULL,
@@ -206,6 +208,7 @@ async function initializeMatchmakingSchema() {
                 opponent_user_id BIGINT NULL,
                 opponent_nickname VARCHAR(64) NULL,
                 matched_word VARCHAR(64) NULL,
+                match_round_no INT NOT NULL DEFAULT 1,
                 created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
                 updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
                 resolved_at DATETIME(3) NULL,
@@ -221,6 +224,12 @@ async function initializeMatchmakingSchema() {
 
         await ensureColumn(
             db,
+            "matchmaking_room",
+            "match_round_no",
+            "match_round_no INT NOT NULL DEFAULT 1 AFTER matched_word"
+        );
+        await ensureColumn(
+            db,
             "matchmaking_ticket",
             "matched_word_bank",
             "matched_word_bank VARCHAR(32) NULL AFTER word_bank"
@@ -230,6 +239,12 @@ async function initializeMatchmakingSchema() {
             "matchmaking_ticket",
             "allow_bot_fallback",
             "allow_bot_fallback TINYINT(1) NOT NULL DEFAULT 1 AFTER matched_word_bank"
+        );
+        await ensureColumn(
+            db,
+            "matchmaking_ticket",
+            "match_round_no",
+            "match_round_no INT NOT NULL DEFAULT 1 AFTER matched_word"
         );
         await ensureColumn(
             db,
@@ -248,6 +263,12 @@ async function initializeMatchmakingSchema() {
             "user_study_session_summary",
             "match_room_id",
             "match_room_id VARCHAR(64) NULL AFTER match_ticket_id"
+        );
+        await ensureColumn(
+            db,
+            "user_study_session_summary",
+            "match_round_no",
+            "match_round_no INT NOT NULL DEFAULT 1 AFTER match_room_id"
         );
         await ensureColumn(
             db,
@@ -345,7 +366,7 @@ async function loadTicket(executor, ticketId, lockRow = false) {
     const lockClause = lockRow ? " FOR UPDATE" : "";
     const [rows] = await executor.execute(
         `SELECT ticket_id, user_id, word_bank, status, fallback_at, room_id, opponent_type,
-                opponent_user_id, opponent_nickname, matched_word, matched_word_bank, allow_bot_fallback, created_at, updated_at,
+                opponent_user_id, opponent_nickname, matched_word, match_round_no, matched_word_bank, allow_bot_fallback, created_at, updated_at,
                 resolved_at, cancelled_at
          FROM matchmaking_ticket
          WHERE ticket_id = ?${lockClause}`,
@@ -359,7 +380,7 @@ async function loadWaitingTicketByUser(executor, userId, lockRow = false) {
     const lockClause = lockRow ? " FOR UPDATE" : "";
     const [rows] = await executor.execute(
         `SELECT ticket_id, user_id, word_bank, status, fallback_at, room_id, opponent_type,
-                opponent_user_id, opponent_nickname, matched_word, matched_word_bank, allow_bot_fallback, created_at, updated_at,
+                opponent_user_id, opponent_nickname, matched_word, match_round_no, matched_word_bank, allow_bot_fallback, created_at, updated_at,
                 resolved_at, cancelled_at
          FROM matchmaking_ticket
          WHERE user_id = ? AND status = 'waiting'
@@ -378,7 +399,7 @@ async function loadCandidateTickets(executor, requesterUserId, limit = 20) {
 
     const [rows] = await executor.execute(
         `SELECT ticket_id, user_id, word_bank, status, fallback_at, room_id, opponent_type,
-                opponent_user_id, opponent_nickname, matched_word, matched_word_bank, allow_bot_fallback, created_at, updated_at,
+                opponent_user_id, opponent_nickname, matched_word, match_round_no, matched_word_bank, allow_bot_fallback, created_at, updated_at,
          resolved_at, cancelled_at
          FROM matchmaking_ticket
          WHERE status = 'waiting'
@@ -400,6 +421,34 @@ async function insertRoom(executor, roomId, roomStatus, wordBank, matchedWord, o
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         [roomId, roomStatus, wordBank, matchedWord, opponentType, user1Id, user2Id, matchedAt]
     );
+}
+
+async function loadRoomById(executor, roomId, lockRow = false) {
+    const lockClause = lockRow ? " FOR UPDATE" : "";
+    const [rows] = await executor.execute(
+        `SELECT room_id, room_status, word_bank, matched_word, match_round_no,
+                opponent_type, user1_id, user2_id, matched_at
+         FROM matchmaking_room
+         WHERE room_id = ?${lockClause}`,
+        [roomId]
+    );
+
+    return rows[0] || null;
+}
+
+async function loadMatchedTicketByRoomAndUser(executor, roomId, userId) {
+    const [rows] = await executor.execute(
+        `SELECT ticket_id, user_id, word_bank, status, fallback_at, room_id, opponent_type,
+                opponent_user_id, opponent_nickname, matched_word, match_round_no, matched_word_bank, allow_bot_fallback, created_at, updated_at,
+                resolved_at, cancelled_at
+         FROM matchmaking_ticket
+         WHERE room_id = ? AND user_id = ? AND status = 'matched'
+         ORDER BY resolved_at DESC, updated_at DESC
+         LIMIT 1`,
+        [roomId, userId]
+    );
+
+    return rows[0] || null;
 }
 
 async function resolveWaitingTicketToBot(executor, ticketRow) {
@@ -751,6 +800,91 @@ exports.cancel = async (req, res) => {
         return res.status(outcome.statusCode).json(outcome.body);
     } catch (err) {
         console.error("matchmaking cancel error:", err);
+        return res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
+exports.rematch = async (req, res) => {
+    try {
+        await initializeMatchmakingSchema();
+
+        const userId = Number(req.body.user_id);
+        const roomId = typeof req.body.room_id === "string" ? req.body.room_id.trim() : "";
+        const previousRoundNo = Math.max(1, Number(req.body.previous_match_round_no || req.body.match_round_no) || 1);
+
+        if (!Number.isInteger(userId) || userId <= 0) {
+            return res.status(400).json({ success: false, message: "user_id 无效" });
+        }
+
+        if (!roomId) {
+            return res.status(400).json({ success: false, message: "room_id 不能为空" });
+        }
+
+        const outcome = await withConnection(async connection => {
+            await connection.beginTransaction();
+            try {
+                const room = await loadRoomById(connection, roomId, true);
+                if (!room) {
+                    await connection.rollback();
+                    return { statusCode: 404, body: { success: false, message: "房间不存在" } };
+                }
+
+                if (room.room_status !== "matched" || room.opponent_type !== "human") {
+                    await connection.rollback();
+                    return { statusCode: 409, body: { success: false, message: "当前房间不能再来一局" } };
+                }
+
+                if (Number(room.user1_id) !== userId && Number(room.user2_id) !== userId) {
+                    await connection.rollback();
+                    return { statusCode: 403, body: { success: false, message: "你不在这个房间中" } };
+                }
+
+                const currentRoundNo = Math.max(1, Number(room.match_round_no || 1));
+                if (currentRoundNo <= previousRoundNo) {
+                    const nextRoundNo = previousRoundNo + 1;
+                    const matchedWord = await pickWord(room.word_bank, connection);
+                    if (!matchedWord) {
+                        throw new Error("No match word available");
+                    }
+
+                    await connection.execute(
+                        `UPDATE matchmaking_room
+                         SET matched_word = ?,
+                             match_round_no = ?,
+                             matched_at = UTC_TIMESTAMP(3)
+                         WHERE room_id = ?`,
+                        [matchedWord, nextRoundNo, roomId]
+                    );
+
+                    await connection.execute(
+                        `UPDATE matchmaking_ticket
+                         SET matched_word = ?,
+                             matched_word_bank = ?,
+                             match_round_no = ?,
+                             updated_at = UTC_TIMESTAMP(3),
+                             resolved_at = UTC_TIMESTAMP(3)
+                         WHERE room_id = ? AND status = 'matched'`,
+                        [matchedWord, room.word_bank, nextRoundNo, roomId]
+                    );
+                }
+
+                const ticket = await loadMatchedTicketByRoomAndUser(connection, roomId, userId);
+                if (!ticket) {
+                    await connection.rollback();
+                    return { statusCode: 404, body: { success: false, message: "房间匹配票据不存在" } };
+                }
+
+                await connection.commit();
+                return { statusCode: 200, body: buildMatchedResponse(ticket) };
+            } catch (error) {
+                await connection.rollback();
+                throw error;
+            }
+        });
+
+        return res.status(outcome.statusCode).json(outcome.body);
+    } catch (err) {
+        console.error("matchmaking rematch error:", err);
         return res.status(500).json({ success: false, message: "Server error" });
     }
 };

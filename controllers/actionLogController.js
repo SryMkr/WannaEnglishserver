@@ -149,6 +149,7 @@ exports.getRoomActionLogs = async (req, res) => {
         const matchRoomId = typeof req.query.match_room_id === "string" ? req.query.match_room_id.trim() : "";
         const viewerUserId = Number(req.query.viewer_user_id);
         const afterId = Number(req.query.after_id) || 0;
+        const matchRoundNo = Number(req.query.match_round_no) || 0;
         const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 100));
 
         if (!matchRoomId) {
@@ -158,6 +159,11 @@ exports.getRoomActionLogs = async (req, res) => {
         if (!Number.isInteger(viewerUserId) || viewerUserId <= 0) {
             return res.status(400).json({ success: false, message: "viewer_user_id 无效" });
         }
+
+        const matchRoundClause = matchRoundNo > 0 ? " AND usss.match_round_no = ?" : "";
+        const queryParams = matchRoundNo > 0
+            ? [matchRoomId, viewerUserId, matchRoundNo, afterId]
+            : [matchRoomId, viewerUserId, afterId];
 
         const [rows] = await db.execute(
             `SELECT al.action_log_id,
@@ -173,10 +179,11 @@ exports.getRoomActionLogs = async (req, res) => {
              INNER JOIN user_study_session_summary usss ON usss.session_id = al.session_id
              WHERE usss.match_room_id = ?
                AND al.user_id <> ?
+               ${matchRoundClause}
                AND al.action_log_id > ?
              ORDER BY al.action_log_id ASC
              LIMIT ${limit}`,
-            [matchRoomId, viewerUserId, afterId]
+            queryParams
         );
 
         return res.json({
