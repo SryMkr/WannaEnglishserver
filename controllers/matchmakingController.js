@@ -8,6 +8,7 @@ const {
 const DEFAULT_MATCH_TIMEOUT_MS = Math.max(1000, Number(process.env.MATCH_TIMEOUT_MS) || 5000);
 const BOT_USER_ID = Number(process.env.MATCH_BOT_USER_ID) || 1002;
 const BOT_OPEN_ID = process.env.MATCH_BOT_OPEN_ID || `system-bot-${BOT_USER_ID}`;
+const ROOM_PRESENCE_TIMEOUT_SECONDS = Math.max(5, Number(process.env.MATCH_ROOM_PRESENCE_TIMEOUT_SECONDS) || 12);
 
 let ticketSequence = 0;
 let roomSequence = 0;
@@ -183,6 +184,8 @@ async function initializeMatchmakingSchema() {
                 opponent_type VARCHAR(16) NOT NULL,
                 user1_id BIGINT NOT NULL,
                 user2_id BIGINT NULL,
+                user1_last_seen_at DATETIME(3) NULL,
+                user2_last_seen_at DATETIME(3) NULL,
                 created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
                 matched_at DATETIME(3) NOT NULL,
                 finished_at DATETIME(3) NULL,
@@ -227,6 +230,18 @@ async function initializeMatchmakingSchema() {
             "matchmaking_room",
             "match_round_no",
             "match_round_no INT NOT NULL DEFAULT 1 AFTER matched_word"
+        );
+        await ensureColumn(
+            db,
+            "matchmaking_room",
+            "user1_last_seen_at",
+            "user1_last_seen_at DATETIME(3) NULL AFTER user2_id"
+        );
+        await ensureColumn(
+            db,
+            "matchmaking_room",
+            "user2_last_seen_at",
+            "user2_last_seen_at DATETIME(3) NULL AFTER user1_last_seen_at"
         );
         await ensureColumn(
             db,
@@ -417,9 +432,10 @@ async function loadCandidateTickets(executor, requesterUserId, limit = 20) {
 async function insertRoom(executor, roomId, roomStatus, wordBank, matchedWord, opponentType, user1Id, user2Id, matchedAt) {
     await executor.execute(
         `INSERT INTO matchmaking_room
-            (room_id, room_status, word_bank, matched_word, opponent_type, user1_id, user2_id, matched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [roomId, roomStatus, wordBank, matchedWord, opponentType, user1Id, user2Id, matchedAt]
+            (room_id, room_status, word_bank, matched_word, opponent_type, user1_id, user2_id,
+             user1_last_seen_at, user2_last_seen_at, matched_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [roomId, roomStatus, wordBank, matchedWord, opponentType, user1Id, user2Id, matchedAt, matchedAt, matchedAt]
     );
 }
 
@@ -427,13 +443,63 @@ async function loadRoomById(executor, roomId, lockRow = false) {
     const lockClause = lockRow ? " FOR UPDATE" : "";
     const [rows] = await executor.execute(
         `SELECT room_id, room_status, word_bank, matched_word, match_round_no,
-                opponent_type, user1_id, user2_id, matched_at
+                opponent_type, user1_id, user2_id, user1_last_seen_at, user2_last_seen_at, matched_at
          FROM matchmaking_room
          WHERE room_id = ?${lockClause}`,
         [roomId]
     );
 
     return rows[0] || null;
+}
+
+function resolveRoomUserSlot(room, userId) {
+    if (!room) {
+        return null;
+    }
+
+    if (Number(room.user1_id) === Number(userId)) {
+        return {
+            selfColumn: "user1_last_seen_at",
+            opponentColumn: "user2_last_seen_at",
+            opponentUserId: Number(room.user2_id || 0)
+        };
+    }
+
+    if (Number(room.user2_id) === Number(userId)) {
+        return {
+            selfColumn: "user2_last_seen_at",
+            opponentColumn: "user1_last_seen_at",
+            opponentUserId: Number(room.user1_id || 0)
+        };
+    }
+
+    return null;
+}
+
+function isPresenceFresh(value, nowMs = Date.now()) {
+    if (!value) {
+        return false;
+    }
+
+    const timestamp = value instanceof Date ? value.getTime() : new Date(value).getTime();
+    return Number.isFinite(timestamp) && nowMs - timestamp <= ROOM_PRESENCE_TIMEOUT_SECONDS * 1000;
+}
+
+function buildPresenceResponse(room, slot) {
+    const opponentLastSeenAt = slot != null ? room?.[slot.opponentColumn] : null;
+    const opponentOnline = isPresenceFresh(opponentLastSeenAt);
+    return {
+        success: true,
+        status: room.room_status,
+        room_id: room.room_id,
+        room_active: room.room_status === "matched",
+        opponent_online: opponentOnline,
+        opponent_user_id: slot != null ? slot.opponentUserId : 0,
+        match_round_no: Number(room.match_round_no || 1),
+        word: room.matched_word || null,
+        matched_word_bank: room.word_bank || null,
+        timeout_seconds: ROOM_PRESENCE_TIMEOUT_SECONDS
+    };
 }
 
 async function loadMatchedTicketByRoomAndUser(executor, roomId, userId) {
@@ -885,6 +951,142 @@ exports.rematch = async (req, res) => {
         return res.status(outcome.statusCode).json(outcome.body);
     } catch (err) {
         console.error("matchmaking rematch error:", err);
+        return res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
+exports.heartbeat = async (req, res) => {
+    try {
+        await initializeMatchmakingSchema();
+
+        const userId = Number(req.body.user_id);
+        const roomId = typeof req.body.room_id === "string" ? req.body.room_id.trim() : "";
+
+        if (!Number.isInteger(userId) || userId <= 0) {
+            return res.status(400).json({ success: false, message: "user_id 无效" });
+        }
+
+        if (!roomId) {
+            return res.status(400).json({ success: false, message: "room_id 不能为空" });
+        }
+
+        const outcome = await withConnection(async connection => {
+            await connection.beginTransaction();
+            try {
+                const room = await loadRoomById(connection, roomId, true);
+                if (!room) {
+                    await connection.rollback();
+                    return { statusCode: 404, body: { success: false, message: "房间不存在" } };
+                }
+
+                const slot = resolveRoomUserSlot(room, userId);
+                if (!slot) {
+                    await connection.rollback();
+                    return { statusCode: 403, body: { success: false, message: "你不在这个房间中" } };
+                }
+
+                await connection.execute(
+                    `UPDATE matchmaking_room
+                     SET ${slot.selfColumn} = UTC_TIMESTAMP(3)
+                     WHERE room_id = ?`,
+                    [roomId]
+                );
+
+                const updatedRoom = await loadRoomById(connection, roomId, false);
+                await connection.commit();
+                return { statusCode: 200, body: buildPresenceResponse(updatedRoom, slot) };
+            } catch (error) {
+                await connection.rollback();
+                throw error;
+            }
+        });
+
+        return res.status(outcome.statusCode).json(outcome.body);
+    } catch (err) {
+        console.error("matchmaking heartbeat error:", err);
+        return res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
+exports.resume = async (req, res) => {
+    try {
+        await initializeMatchmakingSchema();
+
+        const userId = Number(req.body.user_id);
+        const roomId = typeof req.body.room_id === "string" ? req.body.room_id.trim() : "";
+
+        if (!Number.isInteger(userId) || userId <= 0) {
+            return res.status(400).json({ success: false, message: "user_id 无效" });
+        }
+
+        if (!roomId) {
+            return res.status(400).json({ success: false, message: "room_id 不能为空" });
+        }
+
+        const outcome = await withConnection(async connection => {
+            await connection.beginTransaction();
+            try {
+                const room = await loadRoomById(connection, roomId, true);
+                if (!room) {
+                    await connection.rollback();
+                    return { statusCode: 404, body: { success: false, message: "房间不存在" } };
+                }
+
+                const slot = resolveRoomUserSlot(room, userId);
+                if (!slot) {
+                    await connection.rollback();
+                    return { statusCode: 403, body: { success: false, message: "你不在这个房间中" } };
+                }
+
+                if (room.room_status !== "matched") {
+                    await connection.rollback();
+                    return { statusCode: 409, body: { success: false, message: "房间已失效", status: room.room_status } };
+                }
+
+                if (!isPresenceFresh(room[slot.opponentColumn])) {
+                    await connection.execute(
+                        `UPDATE matchmaking_room
+                         SET room_status = 'abandoned',
+                             finished_at = UTC_TIMESTAMP(3),
+                             ${slot.selfColumn} = UTC_TIMESTAMP(3)
+                         WHERE room_id = ? AND room_status = 'matched'`,
+                        [roomId]
+                    );
+                    await connection.execute(
+                        `UPDATE matchmaking_ticket
+                         SET status = 'cancelled',
+                             cancelled_at = UTC_TIMESTAMP(3)
+                         WHERE room_id = ? AND status = 'matched'`,
+                        [roomId]
+                    );
+                    await connection.commit();
+                    return { statusCode: 409, body: { success: false, message: "对方已不在房间中，房间已失效", status: "abandoned" } };
+                }
+
+                await connection.execute(
+                    `UPDATE matchmaking_room
+                     SET ${slot.selfColumn} = UTC_TIMESTAMP(3)
+                     WHERE room_id = ?`,
+                    [roomId]
+                );
+
+                const ticket = await loadMatchedTicketByRoomAndUser(connection, roomId, userId);
+                if (!ticket) {
+                    await connection.rollback();
+                    return { statusCode: 404, body: { success: false, message: "房间匹配票据不存在" } };
+                }
+
+                await connection.commit();
+                return { statusCode: 200, body: buildMatchedResponse(ticket) };
+            } catch (error) {
+                await connection.rollback();
+                throw error;
+            }
+        });
+
+        return res.status(outcome.statusCode).json(outcome.body);
+    } catch (err) {
+        console.error("matchmaking resume error:", err);
         return res.status(500).json({ success: false, message: "Server error" });
     }
 };
