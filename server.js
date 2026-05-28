@@ -5,6 +5,7 @@ const cors = require('cors');
 const util = require('util');
 const path = require('path');
 const matchmakingController = require("./controllers/matchmakingController");
+const friendRoomController = require("./controllers/friendRoomController");
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
@@ -78,6 +79,7 @@ app.use("/dailySummary", require("./routes/summary"));
 app.use("/testSummary", require("./routes/testSummary"));
 app.use("/progress", require("./routes/progress"));
 app.use("/matchmaking", require("./routes/matchmaking"));
+app.use("/friend-room", require("./routes/friendRoom"));
 app.use("/leaderboard", require("./routes/leaderboard"));
 app.use("/ai", require("./routes/ai"));
 app.use("/custom-training-words", require("./routes/customTrainingWords"));
@@ -103,6 +105,7 @@ app.use((err, req, res, next) => {
 
 async function startServer() {
     await matchmakingController.initializeMatchmakingSchema();
+    await friendRoomController.initializeFriendRoomSchema();
 
     app.listen(port, "0.0.0.0", () => {
         console.log(`Server running at http://0.0.0.0:${port}`);
