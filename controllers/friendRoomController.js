@@ -172,6 +172,7 @@ async function initializeFriendRoomSchema() {
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`
         );
 
+        await ensureColumn(db, "friend_room", "match_room_id", "match_room_id VARCHAR(64) NULL AFTER status");
         await ensureColumn(db, "friend_room", "host_ticket_id", "host_ticket_id VARCHAR(64) NULL AFTER match_room_id");
         await ensureColumn(db, "friend_room", "match_round_no", "match_round_no INT NOT NULL DEFAULT 1 AFTER match_room_id");
         await ensureColumn(db, "friend_room", "guest_ticket_id", "guest_ticket_id VARCHAR(64) NULL AFTER host_ticket_id");

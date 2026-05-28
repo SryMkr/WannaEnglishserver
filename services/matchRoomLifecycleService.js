@@ -23,16 +23,10 @@ async function abandonMatchedRoom(executor, roomId, selfLastSeenColumn = null) {
         [roomId]
     );
 
-    try {
-        await executor.execute(
-            "UPDATE friend_room SET status = 'cancelled' WHERE match_room_id = ? AND status = 'matched'",
-            [roomId]
-        );
-    } catch (error) {
-        if (error == null || error.code !== "ER_NO_SUCH_TABLE") {
-            throw error;
-        }
-    }
+    await executor.execute(
+        "UPDATE friend_room SET status = 'cancelled' WHERE match_room_id = ? AND status = 'matched'",
+        [roomId]
+    );
 }
 
 module.exports = {
