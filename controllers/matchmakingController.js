@@ -1024,10 +1024,16 @@ exports.rematch = async (req, res) => {
                     return { statusCode: 200, body: buildMatchedResponse(ticket) };
                 }
 
-                const requestedAt = updatedRoom.rematch_requested_at instanceof Date
-                    ? updatedRoom.rematch_requested_at.getTime()
-                    : new Date(updatedRoom.rematch_requested_at).getTime();
-                if (Number.isFinite(requestedAt) && Date.now() - requestedAt > REMATCH_WAIT_TIMEOUT_SECONDS * 1000) {
+                const [timeoutRows] = await connection.execute(
+                    `SELECT TIMESTAMPDIFF(SECOND, rematch_requested_at, UTC_TIMESTAMP(3)) AS wait_seconds
+                     FROM matchmaking_room
+                     WHERE room_id = ?
+                       AND rematch_requested_at IS NOT NULL
+                     LIMIT 1`,
+                    [roomId]
+                );
+                const waitedSeconds = Number(timeoutRows[0]?.wait_seconds || 0);
+                if (waitedSeconds > REMATCH_WAIT_TIMEOUT_SECONDS) {
                     await connection.execute(
                         `UPDATE matchmaking_room
                          SET user1_rematch_round_no = 0,
