@@ -9,7 +9,7 @@ exports.saveDailySummary = async (req, res) => {
         }
 
         const numericGameModeID = Number(gameModeID);
-        if (!Number.isInteger(numericGameModeID) || numericGameModeID <= 0 || numericGameModeID > 255) {
+        if (numericGameModeID !== 1) {
             return res.status(400).json({ error: "Invalid gameModeID" });
         }
 

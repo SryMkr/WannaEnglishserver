@@ -77,12 +77,10 @@ app.use("/userGameData", require("./routes/userGameData"));
 app.use("/device", require("./routes/device"));
 
 app.use("/dailySummary", require("./routes/summary"));
-app.use("/testSummary", require("./routes/testSummary"));
 app.use("/progress", require("./routes/progress"));
 app.use("/matchmaking", require("./routes/matchmaking"));
 app.use("/friend-room", require("./routes/friendRoom"));
 app.use("/leaderboard", require("./routes/leaderboard"));
-app.use("/ai", require("./routes/ai"));
 app.use("/custom-training-words", require("./routes/customTrainingWords"));
 
 // 绑定学习会话路由

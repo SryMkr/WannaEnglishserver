@@ -4,7 +4,6 @@ const TABLE_CACHE_TTL_MS = Number(process.env.LOOKUP_CACHE_TTL_MS) || 5 * 60 * 1
 
 const tableCache = new Map();
 const wordIdCache = new Map();
-const testTypeCodeCache = new Map();
 
 function normalizeLookupKey(value) {
     if (value == null) {
@@ -87,28 +86,7 @@ async function getWordId(word) {
     return wordId;
 }
 
-async function getTestTypeCode(typeName) {
-    const normalizedKey = normalizeLookupKey(typeName);
-    if (!normalizedKey) {
-        return null;
-    }
-
-    if (testTypeCodeCache.has(normalizedKey)) {
-        return testTypeCodeCache.get(normalizedKey);
-    }
-
-    const [rows] = await db.execute(
-        "SELECT test_type_code FROM test_type_code WHERE type_name_en = ? LIMIT 1",
-        [String(typeName).trim()]
-    );
-
-    const testTypeCode = rows.length > 0 ? rows[0].test_type_code : null;
-    testTypeCodeCache.set(normalizedKey, testTypeCode);
-    return testTypeCode;
-}
-
 module.exports = {
     getCodeByName,
-    getWordId,
-    getTestTypeCode
+    getWordId
 };

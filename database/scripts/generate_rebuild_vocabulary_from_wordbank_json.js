@@ -148,7 +148,6 @@ function main() {
     for (const table of [
         "action_log",
         "user_study_session_summary",
-        "user_test_daily_summary",
         "user_word_progress"
     ]) {
         lines.push(`TRUNCATE TABLE ${table};`);
