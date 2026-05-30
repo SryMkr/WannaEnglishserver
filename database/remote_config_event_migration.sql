@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS remote_config_event (
+    event_id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT NULL,
+    event_name VARCHAR(64) NOT NULL,
+    resource_badge VARCHAR(32) NOT NULL DEFAULT 'prod',
+    fallback TINYINT(1) NOT NULL DEFAULT 0,
+    source VARCHAR(32) NULL,
+    reason VARCHAR(255) NULL,
+    app_version VARCHAR(64) NULL,
+    release_id VARCHAR(64) NULL,
+    platform VARCHAR(64) NULL,
+    device_model VARCHAR(128) NULL,
+    os_version VARCHAR(64) NULL,
+    duration_ms INT NULL,
+    detail_json JSON NULL,
+    created_at DATETIME(6) NOT NULL,
+    KEY idx_remote_config_event_badge_time (resource_badge, created_at),
+    KEY idx_remote_config_event_user_time (user_id, created_at),
+    KEY idx_remote_config_event_name_time (event_name, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

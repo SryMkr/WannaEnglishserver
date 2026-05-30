@@ -86,6 +86,7 @@ app.use("/custom-training-words", require("./routes/customTrainingWords"));
 // 绑定学习会话路由
 app.use("/study-session", require("./routes/studySessionRoutes"));
 app.use("/action-log", require("./routes/actionLogRoutes"));
+app.use("/remote-config", require("./routes/remoteConfig"));
 // 绑定微信路由
 app.use('/weChat', require('./routes/wechatRoutes'));
 
