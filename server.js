@@ -30,6 +30,23 @@ app.use(
     })
 );
 
+const fontRoot = process.env.FONT_STATIC_ROOT || "/www/wwwroot/Fonts";
+app.use(
+    "/static/fonts",
+    express.static(fontRoot, {
+        fallthrough: false,
+        immutable: true,
+        maxAge: "30d",
+        setHeaders: (res, filePath) => {
+            if (filePath.endsWith(".otf")) {
+                res.type("font/otf");
+            } else if (filePath.endsWith(".ttf")) {
+                res.type("font/ttf");
+            }
+        }
+    })
+);
+
 function summarizePayload(payload) {
     if (payload == null) {
         return "null";
