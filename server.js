@@ -17,6 +17,14 @@ const enableVerboseRequestLogs =
 
 app.disable("x-powered-by");
 app.use(cors());
+app.use(
+    "/remote-config/profiler",
+    express.raw({
+        type: "*/*",
+        limit: process.env.PROFILER_UPLOAD_LIMIT || "4mb"
+    }),
+    require("./routes/profilerUpload")
+);
 app.use(express.json({ limit: requestJsonLimit }));
 app.use(express.urlencoded({ extended: true, limit: requestJsonLimit }));
 
