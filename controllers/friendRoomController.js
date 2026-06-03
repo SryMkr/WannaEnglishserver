@@ -567,7 +567,8 @@ async function ready(req, res) {
                 }
 
                 if (Number(room.host_user_id) === userId) {
-                    await connection.execute("UPDATE friend_room SET host_ready = 1 WHERE invite_id = ?", [room.invite_id]);
+                    await connection.rollback();
+                    return { statusCode: 409, body: { success: false, message: "房主请点击开始游戏" } };
                 } else if (Number(room.guest_user_id || 0) === userId) {
                     await connection.execute("UPDATE friend_room SET guest_ready = 1 WHERE invite_id = ?", [room.invite_id]);
                 } else {
@@ -575,6 +576,72 @@ async function ready(req, res) {
                     return { statusCode: 403, body: { success: false, message: "你不在这个房间中" } };
                 }
 
+                room = await loadRoomByInviteOrCode(connection, { inviteId: room.invite_id }, false);
+                await connection.commit();
+                return { statusCode: 200, body: buildRoomResponse(room, userId) };
+            } catch (error) {
+                await connection.rollback();
+                throw error;
+            }
+        });
+
+        return res.status(result.statusCode).json(result.body);
+    } catch (error) {
+        console.error("friend room ready error:", error);
+        return res.status(500).json({ success: false, message: "Server error" });
+    }
+}
+
+async function start(req, res) {
+    try {
+        await initializeFriendRoomSchema();
+
+        const userId = normalizeUserId(req.body.user_id ?? req.body.userID);
+        if (userId == null) {
+            return res.status(400).json({ success: false, message: "user_id is required" });
+        }
+
+        const result = await withConnection(async connection => {
+            await connection.beginTransaction();
+            try {
+                let room = await loadRoomByInviteOrCode(connection, {
+                    inviteId: req.body.invite_id || req.body.inviteId,
+                    roomCode: req.body.room_code || req.body.roomCode
+                }, true);
+                room = await expireRoomIfNeeded(connection, room);
+                room = await syncMatchedRoomState(connection, room, true);
+
+                if (!room) {
+                    await connection.rollback();
+                    return { statusCode: 404, body: { success: false, message: "房间不存在" } };
+                }
+
+                if (room.status === "expired") {
+                    await connection.rollback();
+                    return { statusCode: 410, body: { success: false, message: "房间已过期" } };
+                }
+
+                if (room.status === "cancelled") {
+                    await connection.rollback();
+                    return { statusCode: 409, body: { success: false, message: "房间已取消" } };
+                }
+
+                if (Number(room.host_user_id) !== userId) {
+                    await connection.rollback();
+                    return { statusCode: 403, body: { success: false, message: "只有房主可以开始游戏" } };
+                }
+
+                if (Number(room.guest_user_id || 0) <= 0) {
+                    await connection.rollback();
+                    return { statusCode: 409, body: { success: false, message: "等待好友加入" } };
+                }
+
+                if (Number(room.guest_ready) !== 1) {
+                    await connection.rollback();
+                    return { statusCode: 409, body: { success: false, message: "等待好友准备" } };
+                }
+
+                await connection.execute("UPDATE friend_room SET host_ready = 1 WHERE invite_id = ?", [room.invite_id]);
                 room = await loadRoomByInviteOrCode(connection, { inviteId: room.invite_id }, true);
                 room = await finalizeMatchIfReady(connection, room);
                 await connection.commit();
@@ -587,7 +654,7 @@ async function ready(req, res) {
 
         return res.status(result.statusCode).json(result.body);
     } catch (error) {
-        console.error("friend room ready error:", error);
+        console.error("friend room start error:", error);
         return res.status(500).json({ success: false, message: "Server error" });
     }
 }
@@ -646,5 +713,6 @@ module.exports = {
     join,
     status,
     ready,
+    start,
     leave
 };

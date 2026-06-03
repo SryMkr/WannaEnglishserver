@@ -451,8 +451,7 @@ exports.getStudyStatsOverview = async (req, res) => {
 
         const [wordRows] = await db.execute(
             `SELECT
-                 COUNT(*) AS total_learned_words,
-                 SUM(CASE WHEN DATE(last_studied_at) = CURRENT_DATE() THEN 1 ELSE 0 END) AS today_learned_words
+                 COUNT(*) AS total_learned_words
              FROM user_word_progress
              WHERE user_id = ?`,
             [userId]
@@ -463,8 +462,7 @@ exports.getStudyStatsOverview = async (req, res) => {
             success: true,
             totalStudyDays: studyDayRows.length,
             streakDays: calculateStreakDays(studyDayRows),
-            totalLearnedWords: Number(wordStats.total_learned_words || 0),
-            todayLearnedWords: Number(wordStats.today_learned_words || 0)
+            totalLearnedWords: Number(wordStats.total_learned_words || 0)
         });
     } catch (err) {
         console.error("getStudyStatsOverview Error:", err);
