@@ -237,6 +237,7 @@ async function recordRemoteConfigEvent(payload) {
 }
 
 module.exports = {
+    ensureSchema,
     resolveResourceBadge,
     recordRemoteConfigEvent,
     buildFallbackResponse

@@ -7,6 +7,7 @@ const {
 const {
     abandonMatchedRoom
 } = require("../services/matchRoomLifecycleService");
+const { pickRandomWordForm } = require("../services/wordSelectionService");
 const { formatChinaIsoDateTime } = require("../services/timeService");
 
 const ROOM_TTL_MINUTES = Math.max(5, Number(process.env.FRIEND_ROOM_TTL_MINUTES) || 30);
@@ -281,41 +282,7 @@ async function connectionSafeCancelFriendRoom(executor, inviteId) {
 }
 
 async function pickWord(wordBank, executor = db) {
-    const normalizedWordBank = normalizeWordBank(wordBank);
-    const levelCode = getWordBankLevelCode(normalizedWordBank);
-
-    if (levelCode != null) {
-        const [countRows] = await executor.execute(
-            `SELECT COUNT(*) AS total
-             FROM vocabulary v
-             INNER JOIN vocabulary_level_relation vlr ON vlr.word_id = v.word_id
-             WHERE JSON_CONTAINS(vlr.language_level_codes, ?, '$')`,
-            [String(levelCode)]
-        );
-
-        const total = Number(countRows[0]?.total || 0);
-        if (total > 0) {
-            const offset = Math.max(0, Math.floor(Math.random() * total));
-            const [rows] = await executor.query(
-                `SELECT v.word_form
-                 FROM vocabulary v
-                 INNER JOIN vocabulary_level_relation vlr ON vlr.word_id = v.word_id
-                 WHERE JSON_CONTAINS(vlr.language_level_codes, ?, '$')
-                 ORDER BY v.word_id
-                 LIMIT 1 OFFSET ${offset}`,
-                [String(levelCode)]
-            );
-
-            if (rows.length > 0) {
-                return rows[0].word_form;
-            }
-        }
-    }
-
-    const [rows] = await executor.query(
-        "SELECT word_form FROM vocabulary ORDER BY RAND() LIMIT 1"
-    );
-    return rows.length > 0 ? rows[0].word_form : null;
+    return await pickRandomWordForm(wordBank, executor);
 }
 
 async function buildUniqueRoomCode(executor) {

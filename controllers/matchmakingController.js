@@ -1,17 +1,15 @@
 const db = require("../config/db");
 const {
-    getWordBankLevelCode,
     normalizeWordBank,
     resolveSharedWordBank
 } = require("../services/wordBankService");
 const {
     abandonMatchedRoom
 } = require("../services/matchRoomLifecycleService");
+const { pickRandomWordForm } = require("../services/wordSelectionService");
 const { formatChinaIsoDateTime } = require("../services/timeService");
 
 const DEFAULT_MATCH_TIMEOUT_MS = Math.max(1000, Number(process.env.MATCH_TIMEOUT_MS) || 5000);
-const BOT_USER_ID = Number(process.env.MATCH_BOT_USER_ID) || 1002;
-const BOT_OPEN_ID = process.env.MATCH_BOT_OPEN_ID || `system-bot-${BOT_USER_ID}`;
 const ROOM_PRESENCE_TIMEOUT_SECONDS = Math.max(5, Number(process.env.MATCH_ROOM_PRESENCE_TIMEOUT_SECONDS) || 12);
 const ROOM_RESUME_GRACE_SECONDS = Math.max(
     ROOM_PRESENCE_TIMEOUT_SECONDS,
@@ -44,33 +42,6 @@ function normalizeTimeoutMs(timeoutSeconds) {
     }
 
     return Math.max(1000, Math.round(numericTimeoutSeconds * 1000));
-}
-
-function normalizeBoolean(value, defaultValue = false) {
-    if (value == null || value === "") {
-        return defaultValue;
-    }
-
-    if (typeof value === "boolean") {
-        return value;
-    }
-
-    if (typeof value === "number") {
-        return value !== 0;
-    }
-
-    if (typeof value === "string") {
-        const normalized = value.trim().toLowerCase();
-        if (["true", "1", "yes", "y"].includes(normalized)) {
-            return true;
-        }
-
-        if (["false", "0", "no", "n"].includes(normalized)) {
-            return false;
-        }
-    }
-
-    return defaultValue;
 }
 
 function toIsoString(value) {
@@ -163,15 +134,6 @@ async function withConnection(work) {
     }
 }
 
-async function ensureBotUserProfile(executor = db) {
-    await executor.execute(
-        `INSERT INTO user_profile (user_id, open_id, session_key)
-         VALUES (?, ?, NULL)
-         ON DUPLICATE KEY UPDATE user_id = user_id`,
-        [BOT_USER_ID, BOT_OPEN_ID]
-    );
-}
-
 async function hasColumn(executor, tableName, columnName) {
     const [rows] = await executor.execute(
         `SELECT 1
@@ -192,6 +154,28 @@ async function ensureColumn(executor, tableName, columnName, definitionSql) {
     }
 
     await executor.execute(`ALTER TABLE ${tableName} ADD COLUMN ${definitionSql}`);
+}
+
+async function hasIndex(executor, tableName, indexName) {
+    const [rows] = await executor.execute(
+        `SELECT 1
+         FROM INFORMATION_SCHEMA.STATISTICS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = ?
+           AND INDEX_NAME = ?
+         LIMIT 1`,
+        [tableName, indexName]
+    );
+
+    return rows.length > 0;
+}
+
+async function ensureIndex(executor, tableName, indexName, definitionSql) {
+    if (await hasIndex(executor, tableName, indexName)) {
+        return;
+    }
+
+    await executor.execute(`ALTER TABLE ${tableName} ADD INDEX ${indexName} ${definitionSql}`);
 }
 
 async function initializeMatchmakingSchema() {
@@ -232,7 +216,7 @@ async function initializeMatchmakingSchema() {
                 user_id BIGINT NOT NULL,
                 word_bank VARCHAR(32) NULL,
                 matched_word_bank VARCHAR(32) NULL,
-                allow_bot_fallback TINYINT(1) NOT NULL DEFAULT 1,
+                allow_bot_fallback TINYINT(1) NOT NULL DEFAULT 0,
                 status VARCHAR(16) NOT NULL,
                 fallback_at DATETIME(3) NOT NULL,
                 room_id VARCHAR(64) NULL,
@@ -300,7 +284,7 @@ async function initializeMatchmakingSchema() {
             db,
             "matchmaking_ticket",
             "allow_bot_fallback",
-            "allow_bot_fallback TINYINT(1) NOT NULL DEFAULT 1 AFTER matched_word_bank"
+            "allow_bot_fallback TINYINT(1) NOT NULL DEFAULT 0 AFTER matched_word_bank"
         );
         await ensureColumn(
             db,
@@ -362,8 +346,13 @@ async function initializeMatchmakingSchema() {
             "winner_user_id",
             "winner_user_id BIGINT NULL AFTER first_player"
         );
+        await ensureIndex(
+            db,
+            "matchmaking_ticket",
+            "idx_matchmaking_ticket_waiting_order",
+            "(status, created_at, user_id, word_bank)"
+        );
 
-        await ensureBotUserProfile(db);
     })().catch(error => {
         schemaInitializationPromise = null;
         throw error;
@@ -373,55 +362,7 @@ async function initializeMatchmakingSchema() {
 }
 
 async function pickWord(wordBank, executor = db) {
-    const normalizedWordBank = normalizeWordBank(wordBank);
-    const levelCode = getWordBankLevelCode(normalizedWordBank);
-
-    if (levelCode != null) {
-        const [countRows] = await executor.execute(
-            `SELECT COUNT(*) AS total
-             FROM vocabulary v
-             INNER JOIN vocabulary_level_relation vlr ON vlr.word_id = v.word_id
-             WHERE JSON_CONTAINS(vlr.language_level_codes, ?, '$')`,
-            [String(levelCode)]
-        );
-
-        const total = Number(countRows[0]?.total || 0);
-        if (total > 0) {
-            const offset = Math.max(0, Math.floor(Math.random() * total));
-            const [rows] = await executor.query(
-                `SELECT v.word_form
-                 FROM vocabulary v
-                 INNER JOIN vocabulary_level_relation vlr ON vlr.word_id = v.word_id
-                 WHERE JSON_CONTAINS(vlr.language_level_codes, ?, '$')
-                 ORDER BY v.word_id
-                 LIMIT 1 OFFSET ${offset}`,
-                [String(levelCode)]
-            );
-
-            if (rows.length > 0) {
-                return rows[0].word_form;
-            }
-        }
-    }
-
-    const [countRows] = await executor.execute(
-        "SELECT COUNT(*) AS total FROM vocabulary"
-    );
-
-    const total = Number(countRows[0]?.total || 0);
-    if (total <= 0) {
-        return null;
-    }
-
-    const offset = Math.max(0, Math.floor(Math.random() * total));
-    const [rows] = await executor.query(
-        `SELECT word_form
-         FROM vocabulary
-         ORDER BY word_id
-         LIMIT 1 OFFSET ${offset}`
-    );
-
-    return rows.length > 0 ? rows[0].word_form : null;
+    return await pickRandomWordForm(wordBank, executor);
 }
 
 async function loadTicket(executor, ticketId, lockRow = false) {
@@ -466,7 +407,6 @@ async function loadCandidateTickets(executor, requesterUserId, limit = 20) {
          FROM matchmaking_ticket
          WHERE status = 'waiting'
            AND user_id <> ?
-           AND fallback_at > CURRENT_TIMESTAMP(3)
          ORDER BY created_at ASC
          LIMIT ${safeLimit}
          FOR UPDATE`,
@@ -577,49 +517,18 @@ async function loadMatchedTicketByRoomAndUser(executor, roomId, userId) {
     return rows[0] || null;
 }
 
-async function resolveWaitingTicketToBot(executor, ticketRow) {
+async function refreshWaitingTicket(executor, ticketRow, timeoutMs = DEFAULT_MATCH_TIMEOUT_MS) {
     if (!ticketRow || ticketRow.status !== "waiting") {
         return ticketRow;
     }
 
-    if (ticketRow.allow_bot_fallback === 0 || ticketRow.allow_bot_fallback === false) {
-        return ticketRow;
-    }
-
-    await ensureBotUserProfile(executor);
-
-    const matchedWord = await pickWord(ticketRow.word_bank, executor);
-    if (!matchedWord) {
-        throw new Error("No match word available");
-    }
-
-    const roomId = buildRoomId();
-    const matchedAt = "CURRENT_TIMESTAMP(3)";
-
-    await insertRoom(
-        executor,
-        roomId,
-        "matched",
-        ticketRow.word_bank,
-        matchedWord,
-        "bot",
-        ticketRow.user_id,
-        BOT_USER_ID,
-        matchedAt
-    );
-
+    const timeoutMicroseconds = Math.max(1000, Math.round(timeoutMs * 1000));
     await executor.execute(
         `UPDATE matchmaking_ticket
-         SET status = 'matched',
-             room_id = ?,
-             opponent_type = 'bot',
-             opponent_user_id = ?,
-             opponent_nickname = ?,
-             matched_word = ?,
-             matched_word_bank = ?,
-             resolved_at = CURRENT_TIMESTAMP(3)
-         WHERE ticket_id = ?`,
-        [roomId, BOT_USER_ID, "机器人", matchedWord, ticketRow.word_bank, ticketRow.ticket_id]
+         SET fallback_at = CURRENT_TIMESTAMP(3) + INTERVAL ? MICROSECOND,
+             allow_bot_fallback = 0
+         WHERE ticket_id = ? AND status = 'waiting'`,
+        [timeoutMicroseconds, ticketRow.ticket_id]
     );
 
     return await loadTicket(executor, ticketRow.ticket_id, false);
@@ -649,13 +558,29 @@ async function matchWithHuman(executor, requesterUserId, wordBank) {
         return null;
     }
 
+    return await createHumanMatch(executor, {
+        requesterUserId,
+        requesterWordBank: wordBank,
+        requesterTicketId: null,
+        candidate,
+        matchedWordBank
+    });
+}
+
+async function createHumanMatch(executor, {
+    requesterUserId,
+    requesterWordBank,
+    requesterTicketId = null,
+    candidate,
+    matchedWordBank
+}) {
     const matchedWord = await pickWord(matchedWordBank, executor);
     if (!matchedWord) {
         throw new Error("No match word available");
     }
 
     const roomId = buildRoomId();
-    const requesterTicketId = buildTicketId();
+    const finalRequesterTicketId = requesterTicketId || buildTicketId();
     const matchedAt = "CURRENT_TIMESTAMP(3)";
     const requesterNickname = `玩家${requesterUserId}`;
     const candidateNickname = `玩家${candidate.user_id}`;
@@ -686,18 +611,64 @@ async function matchWithHuman(executor, requesterUserId, wordBank) {
         [roomId, requesterUserId, requesterNickname, matchedWord, matchedWordBank, candidate.ticket_id]
     );
 
-    await executor.execute(
-        `INSERT INTO matchmaking_ticket
-            (ticket_id, user_id, word_bank, matched_word_bank, status, fallback_at, room_id, opponent_type,
-             opponent_user_id, opponent_nickname, matched_word, resolved_at)
-         VALUES (?, ?, ?, ?, 'matched', CURRENT_TIMESTAMP(3), ?, 'human', ?, ?, ?, CURRENT_TIMESTAMP(3))`,
-        [requesterTicketId, requesterUserId, wordBank, matchedWordBank, roomId, candidate.user_id, candidateNickname, matchedWord]
-    );
+    if (requesterTicketId) {
+        await executor.execute(
+            `UPDATE matchmaking_ticket
+             SET status = 'matched',
+                 room_id = ?,
+                 opponent_type = 'human',
+                 opponent_user_id = ?,
+                 opponent_nickname = ?,
+                 matched_word = ?,
+                 matched_word_bank = ?,
+                 resolved_at = CURRENT_TIMESTAMP(3),
+                 allow_bot_fallback = 0
+             WHERE ticket_id = ? AND status = 'waiting'`,
+            [roomId, candidate.user_id, candidateNickname, matchedWord, matchedWordBank, finalRequesterTicketId]
+        );
+    } else {
+        await executor.execute(
+            `INSERT INTO matchmaking_ticket
+                (ticket_id, user_id, word_bank, matched_word_bank, allow_bot_fallback, status, fallback_at, room_id, opponent_type,
+                 opponent_user_id, opponent_nickname, matched_word, resolved_at)
+             VALUES (?, ?, ?, ?, 0, 'matched', CURRENT_TIMESTAMP(3), ?, 'human', ?, ?, ?, CURRENT_TIMESTAMP(3))`,
+            [finalRequesterTicketId, requesterUserId, requesterWordBank, matchedWordBank, roomId, candidate.user_id, candidateNickname, matchedWord]
+        );
+    }
 
-    return await loadTicket(executor, requesterTicketId, false);
+    return await loadTicket(executor, finalRequesterTicketId, false);
 }
 
-async function createWaitingTicket(executor, userId, wordBank, timeoutMs, allowBotFallback = true) {
+async function matchExistingWaitingWithHuman(executor, waitingTicket, timeoutMs) {
+    if (!waitingTicket || waitingTicket.status !== "waiting") {
+        return waitingTicket;
+    }
+
+    const refreshedTicket = await refreshWaitingTicket(executor, waitingTicket, timeoutMs);
+    const candidates = await loadCandidateTickets(executor, refreshedTicket.user_id);
+    if (!candidates || candidates.length === 0) {
+        return refreshedTicket;
+    }
+
+    for (const candidate of candidates) {
+        const sharedWordBank = resolveSharedWordBank(refreshedTicket.word_bank, candidate.word_bank);
+        if (!sharedWordBank.compatible) {
+            continue;
+        }
+
+        return await createHumanMatch(executor, {
+            requesterUserId: refreshedTicket.user_id,
+            requesterWordBank: refreshedTicket.word_bank,
+            requesterTicketId: refreshedTicket.ticket_id,
+            candidate,
+            matchedWordBank: sharedWordBank.matchedWordBank
+        });
+    }
+
+    return refreshedTicket;
+}
+
+async function createWaitingTicket(executor, userId, wordBank, timeoutMs) {
     const ticketId = buildTicketId();
     const timeoutMicroseconds = Math.max(1000, Math.round(timeoutMs * 1000));
 
@@ -705,13 +676,13 @@ async function createWaitingTicket(executor, userId, wordBank, timeoutMs, allowB
         `INSERT INTO matchmaking_ticket
             (ticket_id, user_id, word_bank, allow_bot_fallback, status, fallback_at)
          VALUES (?, ?, ?, ?, 'waiting', CURRENT_TIMESTAMP(3) + INTERVAL ? MICROSECOND)`,
-        [ticketId, userId, wordBank, allowBotFallback ? 1 : 0, timeoutMicroseconds]
+        [ticketId, userId, wordBank, 0, timeoutMicroseconds]
     );
 
     return await loadTicket(executor, ticketId, false);
 }
 
-async function resolveTicketIfExpired(ticketId) {
+async function refreshTicketIfExpired(ticketId, timeoutMs = DEFAULT_MATCH_TIMEOUT_MS) {
     return withConnection(async connection => {
         await connection.beginTransaction();
         try {
@@ -738,7 +709,7 @@ async function resolveTicketIfExpired(ticketId) {
                 return ticket;
             }
 
-            const resolved = await resolveWaitingTicketToBot(connection, ticket);
+            const resolved = await refreshWaitingTicket(connection, ticket, timeoutMs);
             await connection.commit();
             return resolved;
         } catch (error) {
@@ -746,27 +717,6 @@ async function resolveTicketIfExpired(ticketId) {
             throw error;
         }
     });
-}
-
-async function sweepExpiredWaitingTickets() {
-    await initializeMatchmakingSchema();
-
-    const [rows] = await db.execute(
-        `SELECT ticket_id
-         FROM matchmaking_ticket
-         WHERE status = 'waiting'
-           AND fallback_at <= CURRENT_TIMESTAMP(3)
-         ORDER BY fallback_at ASC
-         LIMIT 20`
-    );
-
-    for (const row of rows) {
-        try {
-            await resolveTicketIfExpired(row.ticket_id);
-        } catch (error) {
-            console.error("matchmaking sweep resolve error:", error);
-        }
-    }
 }
 
 exports.initializeMatchmakingSchema = initializeMatchmakingSchema;
@@ -778,7 +728,6 @@ exports.enqueue = async (req, res) => {
         const userId = Number(req.body.user_id);
         const wordBank = normalizeWordBank(req.body.word_bank);
         const timeoutMs = normalizeTimeoutMs(req.body.timeout_seconds);
-        const allowBotFallback = normalizeBoolean(req.body.allow_bot_fallback, true);
 
         if (!Number.isInteger(userId) || userId <= 0) {
             return res.status(400).json({ success: false, message: "user_id 无效" });
@@ -789,28 +738,7 @@ exports.enqueue = async (req, res) => {
             try {
                 let existingWaiting = await loadWaitingTicketByUser(connection, userId, true);
                 if (existingWaiting) {
-                    if (existingWaiting.allow_bot_fallback !== (allowBotFallback ? 1 : 0)) {
-                        await connection.execute(
-                            `UPDATE matchmaking_ticket
-                             SET allow_bot_fallback = ?
-                             WHERE ticket_id = ? AND status = 'waiting'`,
-                            [allowBotFallback ? 1 : 0, existingWaiting.ticket_id]
-                        );
-                        existingWaiting.allow_bot_fallback = allowBotFallback ? 1 : 0;
-                    }
-
-                    const [expiryRows] = await connection.execute(
-                        `SELECT CASE WHEN fallback_at <= CURRENT_TIMESTAMP(3) THEN 1 ELSE 0 END AS expired
-                         FROM matchmaking_ticket
-                         WHERE ticket_id = ?
-                         LIMIT 1`,
-                        [existingWaiting.ticket_id]
-                    );
-
-                    if (Number(expiryRows[0]?.expired || 0) === 1 && existingWaiting.allow_bot_fallback !== 0 && existingWaiting.allow_bot_fallback !== false) {
-                        existingWaiting = await resolveWaitingTicketToBot(connection, existingWaiting);
-                    }
-
+                    existingWaiting = await matchExistingWaitingWithHuman(connection, existingWaiting, timeoutMs);
                     await connection.commit();
                     return existingWaiting;
                 }
@@ -821,7 +749,7 @@ exports.enqueue = async (req, res) => {
                     return matchedTicket;
                 }
 
-                const waitingTicket = await createWaitingTicket(connection, userId, wordBank, timeoutMs, allowBotFallback);
+                const waitingTicket = await createWaitingTicket(connection, userId, wordBank, timeoutMs);
                 await connection.commit();
                 return waitingTicket;
             } catch (error) {
@@ -856,7 +784,7 @@ exports.getStatus = async (req, res) => {
         }
 
         if (ticket.status === "waiting") {
-            ticket = await resolveTicketIfExpired(ticketId);
+            ticket = await refreshTicketIfExpired(ticketId);
             if (!ticket) {
                 return res.status(404).json({ success: false, message: "匹配票据不存在或已失效" });
             }
@@ -1275,9 +1203,3 @@ exports.leave = async (req, res) => {
         return res.status(500).json({ success: false, message: "Server error" });
     }
 };
-
-setInterval(() => {
-    sweepExpiredWaitingTickets().catch(error => {
-        console.error("matchmaking sweep error:", error);
-    });
-}, Math.min(DEFAULT_MATCH_TIMEOUT_MS, 5000)).unref();

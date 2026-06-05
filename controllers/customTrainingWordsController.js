@@ -1,6 +1,6 @@
 const db = require("../config/db");
 
-const MAX_TRAINING_WORDS = 20;
+const MAX_TRAINING_WORDS = 7;
 
 let schemaReadyPromise = null;
 
@@ -110,7 +110,8 @@ async function loadTrainingWords(userId) {
          LEFT JOIN language_level_code ll
              ON ll.language_level_code = CAST(JSON_UNQUOTE(JSON_EXTRACT(vlr.language_level_codes, '$[0]')) AS UNSIGNED)
          WHERE uctw.user_id = ?
-         ORDER BY uctw.sort_order ASC`,
+         ORDER BY uctw.sort_order ASC
+         LIMIT ${MAX_TRAINING_WORDS}`,
         [userId]
     );
 

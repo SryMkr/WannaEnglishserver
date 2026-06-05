@@ -6,6 +6,10 @@ const util = require('util');
 const path = require('path');
 const matchmakingController = require("./controllers/matchmakingController");
 const friendRoomController = require("./controllers/friendRoomController");
+const customTrainingWordsController = require("./controllers/customTrainingWordsController");
+const modeEntryController = require("./controllers/modeEntryController");
+const tutorialStateController = require("./controllers/tutorialStateController");
+const remoteConfigService = require("./services/remoteConfigService");
 const { formatChinaIsoDateTime } = require("./services/timeService");
 
 const app = express();
@@ -107,6 +111,8 @@ app.use("/matchmaking", require("./routes/matchmaking"));
 app.use("/friend-room", require("./routes/friendRoom"));
 app.use("/leaderboard", require("./routes/leaderboard"));
 app.use("/custom-training-words", require("./routes/customTrainingWords"));
+app.use("/mode-entry", require("./routes/modeEntry"));
+app.use("/tutorial-state", require("./routes/tutorialState"));
 
 // 绑定学习会话路由
 app.use("/study-session", require("./routes/studySessionRoutes"));
@@ -131,6 +137,10 @@ app.use((err, req, res, next) => {
 async function startServer() {
     await matchmakingController.initializeMatchmakingSchema();
     await friendRoomController.initializeFriendRoomSchema();
+    await customTrainingWordsController.ensureSchema();
+    await modeEntryController.ensureSchema();
+    await tutorialStateController.ensureSchema();
+    await remoteConfigService.ensureSchema();
 
     app.listen(port, "0.0.0.0", () => {
         console.log(`Server running at http://0.0.0.0:${port}`);

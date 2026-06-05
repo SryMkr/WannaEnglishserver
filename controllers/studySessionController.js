@@ -1,6 +1,7 @@
 const db = require("../config/db");
 const { getWordId } = require("../services/lookupCache");
-const { getWordBankLevelCode, normalizeWordBank } = require("../services/wordBankService");
+const { normalizeWordBank } = require("../services/wordBankService");
+const { pickRandomStudyWord } = require("../services/wordSelectionService");
 const { addDaysToDateString, formatChinaDate } = require("../services/timeService");
 
 function parseJsonField(value, fallback) {
@@ -74,54 +75,7 @@ async function getWordBase(word, wordBank) {
         return rows[0] || null;
     }
 
-    const normalizedWordBank = normalizeWordBank(wordBank);
-    const levelCode = getWordBankLevelCode(normalizedWordBank);
-    if (levelCode != null) {
-        const [countRows] = await db.execute(
-            `SELECT COUNT(*) AS total
-             FROM vocabulary v
-             INNER JOIN vocabulary_level_relation vlr ON vlr.word_id = v.word_id
-             WHERE JSON_CONTAINS(vlr.language_level_codes, ?, '$')`,
-            [String(levelCode)]
-        );
-
-        const total = Number(countRows[0]?.total || 0);
-        if (total <= 0) {
-            return null;
-        }
-
-        const offset = Math.max(0, Math.floor(Math.random() * total));
-        const [rows] = await db.query(
-            `SELECT v.word_id, v.word_form, v.phonetic, v.detail, v.origin, v.word_type, v.structure
-             FROM vocabulary v
-             INNER JOIN vocabulary_level_relation vlr ON vlr.word_id = v.word_id
-             WHERE JSON_CONTAINS(vlr.language_level_codes, ?, '$')
-             ORDER BY v.word_id
-             LIMIT 1 OFFSET ${offset}`,
-            [String(levelCode)]
-        );
-
-        return rows[0] || null;
-    }
-
-    const [countRows] = await db.execute(
-        "SELECT COUNT(*) AS total FROM vocabulary"
-    );
-
-    const total = Number(countRows[0]?.total || 0);
-    if (total <= 0) {
-        return null;
-    }
-
-    const offset = Math.max(0, Math.floor(Math.random() * total));
-    const [rows] = await db.query(
-        `SELECT word_id, word_form, phonetic, detail, origin, word_type, structure
-         FROM vocabulary
-         ORDER BY word_id
-         LIMIT 1 OFFSET ${offset}`
-    );
-
-    return rows[0] || null;
+    return await pickRandomStudyWord(wordBank);
 }
 
 function collectStructureRefIds(structure, role) {
