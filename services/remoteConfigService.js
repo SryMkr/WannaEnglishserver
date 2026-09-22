@@ -6,7 +6,7 @@ const UOS_BASE_URL = process.env.UOS_REMOTE_CONFIG_BASE_URL || "https://c.unity.
 const UOS_SETTINGS_OVERRIDES_PATH = process.env.UOS_REMOTE_CONFIG_SETTINGS_PATH || "/v1/settings/overrides";
 const DEFAULT_RESOURCE_BADGE = "prod";
 const RESOURCE_BADGE_KEY = "resource_badge";
-const ALLOWED_RESOURCE_BADGES = new Set(["prod", "test", "rollback", "ABTest", "gray"]);
+const ALLOWED_RESOURCE_BADGES = new Set(["prod", "test", "stage", "gray"]);
 const REQUEST_TIMEOUT_MS = Number(process.env.UOS_REMOTE_CONFIG_TIMEOUT_MS) || 2500;
 
 let schemaReady = false;

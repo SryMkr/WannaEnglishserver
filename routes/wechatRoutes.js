@@ -5,6 +5,7 @@ const wechatController = require('../controllers/wechatController');
 
 router.post('/login', wechatController.login);
 router.post('/profile', wechatController.saveProfile);
+router.get('/background-fetch/study-stats', wechatController.getBackgroundFetchStudyStats);
 router.get('/customer-service', wechatController.verifyCustomerServiceWebhook);
 router.post(
     '/customer-service',

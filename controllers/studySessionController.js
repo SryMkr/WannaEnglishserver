@@ -386,6 +386,35 @@ exports.searchStudyWord = async (req, res) => {
     }
 };
 
+async function loadStudyStatsOverview(userId) {
+    const [studyDayRows] = await db.execute(
+        `SELECT DATE(played_at) AS study_date
+         FROM user_study_session_summary
+         WHERE game_status = 1
+           AND (user1_id = ? OR user2_id = ?)
+         GROUP BY DATE(played_at)
+         ORDER BY study_date DESC`,
+        [userId, userId]
+    );
+
+    const [wordRows] = await db.execute(
+        `SELECT
+             COUNT(*) AS total_learned_words
+         FROM user_word_progress
+         WHERE user_id = ?`,
+        [userId]
+    );
+
+    const wordStats = wordRows[0] || {};
+    return {
+        totalStudyDays: studyDayRows.length,
+        streakDays: calculateStreakDays(studyDayRows),
+        totalLearnedWords: Number(wordStats.total_learned_words || 0)
+    };
+}
+
+exports.loadStudyStatsOverview = loadStudyStatsOverview;
+
 exports.getStudyStatsOverview = async (req, res) => {
     try {
         const userId = normalizeUserId(req.query.userID || req.query.user_id);
@@ -393,30 +422,10 @@ exports.getStudyStatsOverview = async (req, res) => {
             return res.status(400).json({ success: false, message: "userID is required" });
         }
 
-        const [studyDayRows] = await db.execute(
-            `SELECT DATE(played_at) AS study_date
-             FROM user_study_session_summary
-             WHERE game_status = 1
-               AND (user1_id = ? OR user2_id = ?)
-             GROUP BY DATE(played_at)
-             ORDER BY study_date DESC`,
-            [userId, userId]
-        );
-
-        const [wordRows] = await db.execute(
-            `SELECT
-                 COUNT(*) AS total_learned_words
-             FROM user_word_progress
-             WHERE user_id = ?`,
-            [userId]
-        );
-
-        const wordStats = wordRows[0] || {};
+        const stats = await loadStudyStatsOverview(userId);
         return res.json({
             success: true,
-            totalStudyDays: studyDayRows.length,
-            streakDays: calculateStreakDays(studyDayRows),
-            totalLearnedWords: Number(wordStats.total_learned_words || 0)
+            ...stats
         });
     } catch (err) {
         console.error("getStudyStatsOverview Error:", err);
