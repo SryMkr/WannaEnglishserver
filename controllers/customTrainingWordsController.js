@@ -102,13 +102,13 @@ async function loadTrainingWords(userId) {
              v.detail,
              v.word_type,
              ll.language_level_name AS word_bank,
-             CAST(JSON_UNQUOTE(JSON_EXTRACT(vlr.language_level_codes, '$[0]')) AS UNSIGNED) AS language_level_code,
+             vlr.language_level_code,
              uctw.sort_order
          FROM user_custom_training_word uctw
          INNER JOIN vocabulary v ON v.word_id = uctw.word_id
-         LEFT JOIN vocabulary_level_relation vlr ON vlr.word_id = v.word_id
+         LEFT JOIN vocabulary_language_relation vlr ON vlr.word_id = v.word_id
          LEFT JOIN language_level_code ll
-             ON ll.language_level_code = CAST(JSON_UNQUOTE(JSON_EXTRACT(vlr.language_level_codes, '$[0]')) AS UNSIGNED)
+             ON ll.language_level_code = vlr.language_level_code
          WHERE uctw.user_id = ?
          ORDER BY uctw.sort_order ASC
          LIMIT ${MAX_TRAINING_WORDS}`,

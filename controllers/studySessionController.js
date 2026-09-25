@@ -276,7 +276,16 @@ exports.createStudySession = async (req, res) => {
             actual_word_bank
         } = req.body;
 
-        if (user1_id == null || user2_id == null || !word) {
+        const normalizedUser1Id = Number(user1_id);
+        const opponentType = typeof matchmaking_opponent_type === "string"
+            ? matchmaking_opponent_type.trim().toLowerCase()
+            : "";
+        const normalizedUser2Id = opponentType === "bot" ? null : Number(user2_id);
+
+        if (!Number.isInteger(normalizedUser1Id) || normalizedUser1Id <= 0 ||
+            (opponentType !== "bot" &&
+                (!Number.isInteger(normalizedUser2Id) || normalizedUser2Id <= 0)) ||
+            !word) {
             return res.status(400).json({ message: "Missing parameters" });
         }
 
@@ -293,15 +302,15 @@ exports.createStudySession = async (req, res) => {
                  match_round_no, matchmaking_opponent_user_id, matchmaking_opponent_type, matchmaking_opponent_name, actual_word_bank)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
-                user1_id,
-                user2_id,
+                normalizedUser1Id,
+                normalizedUser2Id,
                 word_id,
                 play_mode ?? null,
                 match_ticket_id ?? null,
                 match_room_id ?? null,
                 normalizedMatchRoundNo,
-                matchmaking_opponent_user_id ?? null,
-                matchmaking_opponent_type ?? null,
+                opponentType === "bot" ? null : (matchmaking_opponent_user_id ?? normalizedUser2Id),
+                opponentType || null,
                 matchmaking_opponent_name ?? null,
                 normalizeWordBank(actual_word_bank)
             ]
@@ -365,11 +374,11 @@ exports.searchStudyWord = async (req, res) => {
                  v.detail,
                  v.word_type,
                  ll.language_level_name AS word_bank,
-                 CAST(JSON_UNQUOTE(JSON_EXTRACT(vlr.language_level_codes, '$[0]')) AS UNSIGNED) AS language_level_code
+                 vlr.language_level_code
              FROM vocabulary v
-             LEFT JOIN vocabulary_level_relation vlr ON vlr.word_id = v.word_id
+             LEFT JOIN vocabulary_language_relation vlr ON vlr.word_id = v.word_id
              LEFT JOIN language_level_code ll
-                 ON ll.language_level_code = CAST(JSON_UNQUOTE(JSON_EXTRACT(vlr.language_level_codes, '$[0]')) AS UNSIGNED)
+                 ON ll.language_level_code = vlr.language_level_code
              WHERE LOWER(v.word_form) = LOWER(?)
              LIMIT 1`,
             [query]

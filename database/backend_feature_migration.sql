@@ -4,8 +4,68 @@
 -- Scope:
 -- 1. Business tables only: matchmaking, custom training words, mode entry, tutorial state, remote config events.
 -- 2. Protected word-base tables are not deleted, rebuilt, or rewritten:
---    vocabulary, vocabulary_level_relation, prefix_code, root_code, suffix_code, language_level_code.
+--    vocabulary, vocabulary_language_relation, prefix_code, root_code, suffix_code, language_level_code.
 -- 3. Idempotent for production: safe to run more than once.
+
+CREATE TABLE IF NOT EXISTS vocabulary_language_relation (
+    word_id INT NOT NULL,
+    language_level_code INT NOT NULL,
+    PRIMARY KEY (word_id, language_level_code),
+    KEY idx_vocabulary_language_relation_level (language_level_code, word_id),
+    CONSTRAINT vocabulary_language_relation_fk_word
+        FOREIGN KEY (word_id) REFERENCES vocabulary(word_id) ON DELETE CASCADE,
+    CONSTRAINT vocabulary_language_relation_fk_level
+        FOREIGN KEY (language_level_code) REFERENCES language_level_code(language_level_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- One-time legacy conversion. It is intentionally guarded and does not touch
+-- vocabulary rows. Run the script once after reviewing its preview counts.
+SET @legacy_relation_exists = (
+    SELECT COUNT(*)
+    FROM INFORMATION_SCHEMA.TABLES
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'vocabulary_level_relation'
+);
+SET @legacy_relation_count = IFNULL((
+    SELECT COUNT(*) FROM vocabulary_level_relation
+), 0);
+SET @normalized_relation_count = (
+    SELECT COUNT(*) FROM vocabulary_language_relation
+);
+SET @copy_legacy_relations_sql = IF(
+    @legacy_relation_exists = 1 AND @legacy_relation_count > 0
+        AND @normalized_relation_count = 0,
+    'INSERT IGNORE INTO vocabulary_language_relation (word_id, language_level_code)
+     SELECT vlr.word_id,
+            CAST(jt.language_level_code AS UNSIGNED)
+     FROM vocabulary_level_relation vlr
+     JOIN JSON_TABLE(
+         vlr.language_level_codes,
+         ''$[*]'' COLUMNS(language_level_code VARCHAR(16) PATH ''$'')
+     ) jt
+     JOIN language_level_code ll
+       ON ll.language_level_code = CAST(jt.language_level_code AS UNSIGNED)',
+    'DO 0'
+);
+PREPARE stmt FROM @copy_legacy_relations_sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+-- Once the normalized table has been reviewed, remove the JSON table so there
+-- is only one vocabulary relationship source.
+SET @drop_legacy_relation_sql = IF(
+    @legacy_relation_exists = 1
+        AND (
+            SELECT COUNT(*) FROM vocabulary_level_relation
+        ) = (
+            SELECT COUNT(DISTINCT word_id) FROM vocabulary_language_relation
+        ),
+    'DROP TABLE vocabulary_level_relation',
+    'DO 0'
+);
+PREPARE stmt FROM @drop_legacy_relation_sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 CREATE TABLE IF NOT EXISTS matchmaking_room (
     room_id VARCHAR(64) PRIMARY KEY,
@@ -119,7 +179,7 @@ CREATE TABLE IF NOT EXISTS remote_config_event (
 CREATE TABLE IF NOT EXISTS user_study_session_summary (
     session_id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     user1_id BIGINT NOT NULL,
-    user2_id BIGINT NOT NULL,
+    user2_id BIGINT NULL,
     word_id INT NOT NULL,
     play_mode VARCHAR(32) NULL,
     match_ticket_id VARCHAR(64) NULL,
@@ -146,6 +206,22 @@ SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'matchmaking_room' AND COLUMN_NAME = 'match_round_no'),
         'DO 0',
         'ALTER TABLE matchmaking_room ADD COLUMN match_round_no INT NOT NULL DEFAULT 1 AFTER matched_word')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(
+        EXISTS(
+            SELECT 1
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'user_study_session_summary'
+              AND COLUMN_NAME = 'user2_id'
+              AND IS_NULLABLE = 'YES'
+        ),
+        'DO 0',
+        'ALTER TABLE user_study_session_summary MODIFY COLUMN user2_id BIGINT NULL'
+    )
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 

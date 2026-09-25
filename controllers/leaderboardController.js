@@ -128,8 +128,8 @@ async function queryLeaderboard(period, wordBankFilter, currentWordBank, userId)
             up2.avatar_url AS user2_avatar_url
         FROM user_study_session_summary s
         LEFT JOIN matchmaking_ticket mt ON mt.room_id = s.match_room_id
-        LEFT JOIN user_profile up1 ON up1.user_id = s.user1_id
-        LEFT JOIN user_profile up2 ON up2.user_id = s.user2_id
+        INNER JOIN user_profile up1 ON up1.user_id = s.user1_id
+        INNER JOIN user_profile up2 ON up2.user_id = s.user2_id
         WHERE ${base.whereSql}
         ORDER BY s.played_at ASC, s.session_id ASC
     `;

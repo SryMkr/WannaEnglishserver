@@ -14,9 +14,10 @@ function buildVocabularySelectSql(selectColumns) {
 function buildLevelSelectSql(selectColumns, comparator) {
     return `SELECT ${selectColumns}
             FROM vocabulary v
-            INNER JOIN vocabulary_level_relation vlr ON vlr.word_id = v.word_id
-            WHERE JSON_CONTAINS(vlr.language_level_codes, ?, '$')
-              AND v.word_id ${comparator} ?
+            INNER JOIN vocabulary_language_relation vlr
+                ON vlr.word_id = v.word_id
+               AND vlr.language_level_code = ?
+            WHERE v.word_id ${comparator} ?
             ORDER BY v.word_id ${comparator === ">=" ? "ASC" : "DESC"}
             LIMIT 1`;
 }
@@ -26,9 +27,10 @@ async function queryMinMaxWordId(executor, levelCode) {
         const [rows] = await executor.execute(
             `SELECT MIN(v.word_id) AS min_id, MAX(v.word_id) AS max_id
              FROM vocabulary v
-             INNER JOIN vocabulary_level_relation vlr ON vlr.word_id = v.word_id
-             WHERE JSON_CONTAINS(vlr.language_level_codes, ?, '$')`,
-            [String(levelCode)]
+             INNER JOIN vocabulary_language_relation vlr
+                ON vlr.word_id = v.word_id
+               AND vlr.language_level_code = ?`,
+            [Number(levelCode)]
         );
         return rows[0] || null;
     }
@@ -47,7 +49,7 @@ async function queryNearestWord(executor, selectColumns, levelCode, targetId) {
     if (levelCode != null) {
         const [forwardRows] = await executor.execute(
             buildLevelSelectSql(selectColumns, ">="),
-            [String(levelCode), targetId]
+            [Number(levelCode), targetId]
         );
         if (forwardRows.length > 0) {
             return forwardRows[0];
@@ -55,7 +57,7 @@ async function queryNearestWord(executor, selectColumns, levelCode, targetId) {
 
         const [backwardRows] = await executor.execute(
             buildLevelSelectSql(selectColumns, "<="),
-            [String(levelCode), targetId]
+            [Number(levelCode), targetId]
         );
         return backwardRows[0] || null;
     }

@@ -158,7 +158,6 @@ function main() {
         "vocabulary_suffix_relation",
         "vocabulary_root_relation",
         "vocabulary_prefix_relation",
-        "vocabulary_level_relation",
         "vocabulary_language_relation",
         "vocabulary",
         "suffix_code",
@@ -210,11 +209,13 @@ CREATE TABLE vocabulary (
     UNIQUE KEY uk_vocabulary_word_form (word_form)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE vocabulary_level_relation (
+CREATE TABLE vocabulary_language_relation (
     word_id INT NOT NULL,
-    language_level_codes JSON NOT NULL,
-    PRIMARY KEY (word_id),
-    CONSTRAINT vocabulary_level_relation_fk_word FOREIGN KEY (word_id) REFERENCES vocabulary (word_id) ON DELETE CASCADE
+    language_level_code INT NOT NULL,
+    PRIMARY KEY (word_id, language_level_code),
+    KEY idx_vocabulary_language_relation_level (language_level_code, word_id),
+    CONSTRAINT vocabulary_language_relation_fk_word FOREIGN KEY (word_id) REFERENCES vocabulary (word_id) ON DELETE CASCADE,
+    CONSTRAINT vocabulary_language_relation_fk_level FOREIGN KEY (language_level_code) REFERENCES language_level_code (language_level_code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;`);
     lines.push("");
 
@@ -248,7 +249,14 @@ CREATE TABLE vocabulary_level_relation (
         "word_type",
         "structure"
     ], vocabularyRows);
-    emitInsert(lines, "vocabulary_level_relation", ["word_id", "language_level_codes"], levelRows);
+    const relationRows = [];
+    for (const [wordId, codes] of levelRows) {
+        const parsedCodes = JSON.parse(codes[1]);
+        for (const code of parsedCodes) {
+            relationRows.push([sqlLiteral(wordId), sqlLiteral(Number(code))]);
+        }
+    }
+    emitInsert(lines, "vocabulary_language_relation", ["word_id", "language_level_code"], relationRows);
 
     lines.push("SET FOREIGN_KEY_CHECKS = 1;");
     lines.push("");
