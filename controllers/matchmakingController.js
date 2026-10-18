@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const db = require("../config/db");
 const {
     normalizeWordBank,
@@ -17,18 +18,14 @@ const ROOM_RESUME_GRACE_SECONDS = Math.max(
 );
 const REMATCH_WAIT_TIMEOUT_SECONDS = Math.max(5, Number(process.env.MATCH_REMATCH_WAIT_TIMEOUT_SECONDS) || 20);
 
-let ticketSequence = 0;
-let roomSequence = 0;
 let schemaInitializationPromise = null;
 
 function buildTicketId() {
-    ticketSequence += 1;
-    return `ticket_${Date.now()}_${ticketSequence}`;
+    return `ticket_${Date.now()}_${crypto.randomBytes(8).toString("hex")}`;
 }
 
 function buildRoomId() {
-    roomSequence += 1;
-    return `room_${Date.now()}_${roomSequence}`;
+    return `room_${Date.now()}_${crypto.randomBytes(8).toString("hex")}`;
 }
 
 function normalizeTimeoutMs(timeoutSeconds) {
@@ -134,48 +131,39 @@ async function withConnection(work) {
     }
 }
 
-async function hasColumn(executor, tableName, columnName) {
-    const [rows] = await executor.execute(
-        `SELECT 1
-         FROM INFORMATION_SCHEMA.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE()
-           AND TABLE_NAME = ?
-           AND COLUMN_NAME = ?
-         LIMIT 1`,
-        [tableName, columnName]
-    );
-
-    return rows.length > 0;
+function isRetryableTransactionError(error) {
+    return error?.code === "ER_LOCK_DEADLOCK" ||
+        error?.code === "ER_LOCK_WAIT_TIMEOUT" ||
+        error?.errno === 1213 ||
+        error?.errno === 1205;
 }
 
-async function ensureColumn(executor, tableName, columnName, definitionSql) {
-    if (await hasColumn(executor, tableName, columnName)) {
-        return;
+async function withTransactionRetry(work, maxAttempts = 3) {
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            return await withConnection(async connection => {
+                await connection.beginTransaction();
+                try {
+                    const result = await work(connection);
+                    await connection.commit();
+                    return result;
+                } catch (error) {
+                    await connection.rollback();
+                    throw error;
+                }
+            });
+        } catch (error) {
+            lastError = error;
+            if (!isRetryableTransactionError(error) || attempt >= maxAttempts) {
+                throw error;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 25 * attempt));
+        }
     }
 
-    await executor.execute(`ALTER TABLE ${tableName} ADD COLUMN ${definitionSql}`);
-}
-
-async function hasIndex(executor, tableName, indexName) {
-    const [rows] = await executor.execute(
-        `SELECT 1
-         FROM INFORMATION_SCHEMA.STATISTICS
-         WHERE TABLE_SCHEMA = DATABASE()
-           AND TABLE_NAME = ?
-           AND INDEX_NAME = ?
-         LIMIT 1`,
-        [tableName, indexName]
-    );
-
-    return rows.length > 0;
-}
-
-async function ensureIndex(executor, tableName, indexName, definitionSql) {
-    if (await hasIndex(executor, tableName, indexName)) {
-        return;
-    }
-
-    await executor.execute(`ALTER TABLE ${tableName} ADD INDEX ${indexName} ${definitionSql}`);
+    throw lastError;
 }
 
 async function initializeMatchmakingSchema() {
@@ -184,174 +172,65 @@ async function initializeMatchmakingSchema() {
     }
 
     schemaInitializationPromise = (async () => {
-        await db.execute(
-            `CREATE TABLE IF NOT EXISTS matchmaking_room (
-                room_id VARCHAR(64) PRIMARY KEY,
-                room_status VARCHAR(16) NOT NULL DEFAULT 'matched',
-                word_bank VARCHAR(32) NULL,
-                matched_word VARCHAR(64) NOT NULL,
-                match_round_no INT NOT NULL DEFAULT 1,
-                opponent_type VARCHAR(16) NOT NULL,
-                user1_id BIGINT NOT NULL,
-                user2_id BIGINT NULL,
-                user1_last_seen_at DATETIME(3) NULL,
-                user2_last_seen_at DATETIME(3) NULL,
-                user1_rematch_round_no INT NOT NULL DEFAULT 0,
-                user2_rematch_round_no INT NOT NULL DEFAULT 0,
-                rematch_requested_at DATETIME(3) NULL,
-                created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-                matched_at DATETIME(3) NOT NULL,
-                finished_at DATETIME(3) NULL,
-                KEY idx_matchmaking_room_status_time (room_status, matched_at),
-                KEY idx_matchmaking_room_user1_time (user1_id, matched_at),
-                KEY idx_matchmaking_room_user2_time (user2_id, matched_at),
-                CONSTRAINT fk_matchmaking_room_user1 FOREIGN KEY (user1_id) REFERENCES user_profile(user_id),
-                CONSTRAINT fk_matchmaking_room_user2 FOREIGN KEY (user2_id) REFERENCES user_profile(user_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`
-        );
+        const requiredColumns = {
+            matchmaking_room: [
+                "room_id", "room_status", "word_bank", "matched_word", "match_round_no",
+                "opponent_type", "user1_id", "user2_id", "user1_last_seen_at",
+                "user2_last_seen_at", "user1_rematch_round_no", "user2_rematch_round_no",
+                "rematch_requested_at"
+            ],
+            matchmaking_ticket: [
+                "ticket_id", "user_id", "word_bank", "matched_word_bank",
+                "allow_bot_fallback", "status", "fallback_at", "room_id",
+                "opponent_type", "opponent_user_id", "opponent_nickname", "matched_word",
+                "match_round_no"
+            ],
+            user_study_session_summary: [
+                "session_id", "user1_id", "user2_id", "word_id", "play_mode",
+                "match_ticket_id", "match_room_id", "match_round_no",
+                "matchmaking_opponent_user_id", "matchmaking_opponent_type",
+                "matchmaking_opponent_name", "actual_word_bank", "first_player",
+                "winner_user_id", "game_status"
+            ]
+        };
+        for (const [tableName, columns] of Object.entries(requiredColumns)) {
+            const [tableRows] = await db.execute(
+                `SELECT 1
+                 FROM INFORMATION_SCHEMA.TABLES
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+                 LIMIT 1`,
+                [tableName]
+            );
+            if (tableRows.length === 0) {
+                throw new Error(`Database migration required: missing table ${tableName}`);
+            }
 
-        await db.execute(
-            `CREATE TABLE IF NOT EXISTS matchmaking_ticket (
-                ticket_id VARCHAR(64) PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                word_bank VARCHAR(32) NULL,
-                matched_word_bank VARCHAR(32) NULL,
-                allow_bot_fallback TINYINT(1) NOT NULL DEFAULT 0,
-                status VARCHAR(16) NOT NULL,
-                fallback_at DATETIME(3) NOT NULL,
-                room_id VARCHAR(64) NULL,
-                opponent_type VARCHAR(16) NULL,
-                opponent_user_id BIGINT NULL,
-                opponent_nickname VARCHAR(64) NULL,
-                matched_word VARCHAR(64) NULL,
-                match_round_no INT NOT NULL DEFAULT 1,
-                created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-                updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-                resolved_at DATETIME(3) NULL,
-                cancelled_at DATETIME(3) NULL,
-                KEY idx_matchmaking_ticket_user_status (user_id, status, created_at),
-                KEY idx_matchmaking_ticket_status_time (status, fallback_at, created_at),
-                KEY idx_matchmaking_ticket_room (room_id),
-                CONSTRAINT fk_matchmaking_ticket_user FOREIGN KEY (user_id) REFERENCES user_profile(user_id),
-                CONSTRAINT fk_matchmaking_ticket_opponent_user FOREIGN KEY (opponent_user_id) REFERENCES user_profile(user_id),
-                CONSTRAINT fk_matchmaking_ticket_room FOREIGN KEY (room_id) REFERENCES matchmaking_room(room_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`
-        );
+            const [columnRows] = await db.query(
+                `SELECT COLUMN_NAME
+                 FROM INFORMATION_SCHEMA.COLUMNS
+                 WHERE TABLE_SCHEMA = DATABASE()
+                   AND TABLE_NAME = ?
+                   AND COLUMN_NAME IN (${columns.map(() => "?").join(", ")})`,
+                [tableName, ...columns]
+            );
+            const present = new Set(columnRows.map(row => row.COLUMN_NAME));
+            const missing = columns.filter(column => !present.has(column));
+            if (missing.length > 0) {
+                throw new Error(`Database migration required: ${tableName} missing columns ${missing.join(", ")}`);
+            }
+        }
 
-        await ensureColumn(
-            db,
-            "matchmaking_room",
-            "match_round_no",
-            "match_round_no INT NOT NULL DEFAULT 1 AFTER matched_word"
+        const [sessionUser2Column] = await db.execute(
+            `SELECT IS_NULLABLE
+             FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE()
+               AND TABLE_NAME = 'user_study_session_summary'
+               AND COLUMN_NAME = 'user2_id'
+             LIMIT 1`
         );
-        await ensureColumn(
-            db,
-            "matchmaking_room",
-            "user1_last_seen_at",
-            "user1_last_seen_at DATETIME(3) NULL AFTER user2_id"
-        );
-        await ensureColumn(
-            db,
-            "matchmaking_room",
-            "user2_last_seen_at",
-            "user2_last_seen_at DATETIME(3) NULL AFTER user1_last_seen_at"
-        );
-        await ensureColumn(
-            db,
-            "matchmaking_room",
-            "user1_rematch_round_no",
-            "user1_rematch_round_no INT NOT NULL DEFAULT 0 AFTER user2_last_seen_at"
-        );
-        await ensureColumn(
-            db,
-            "matchmaking_room",
-            "user2_rematch_round_no",
-            "user2_rematch_round_no INT NOT NULL DEFAULT 0 AFTER user1_rematch_round_no"
-        );
-        await ensureColumn(
-            db,
-            "matchmaking_room",
-            "rematch_requested_at",
-            "rematch_requested_at DATETIME(3) NULL AFTER user2_rematch_round_no"
-        );
-        await ensureColumn(
-            db,
-            "matchmaking_ticket",
-            "matched_word_bank",
-            "matched_word_bank VARCHAR(32) NULL AFTER word_bank"
-        );
-        await ensureColumn(
-            db,
-            "matchmaking_ticket",
-            "allow_bot_fallback",
-            "allow_bot_fallback TINYINT(1) NOT NULL DEFAULT 0 AFTER matched_word_bank"
-        );
-        await ensureColumn(
-            db,
-            "matchmaking_ticket",
-            "match_round_no",
-            "match_round_no INT NOT NULL DEFAULT 1 AFTER matched_word"
-        );
-        await ensureColumn(
-            db,
-            "user_study_session_summary",
-            "play_mode",
-            "play_mode VARCHAR(32) NULL AFTER word_id"
-        );
-        await ensureColumn(
-            db,
-            "user_study_session_summary",
-            "match_ticket_id",
-            "match_ticket_id VARCHAR(64) NULL AFTER play_mode"
-        );
-        await ensureColumn(
-            db,
-            "user_study_session_summary",
-            "match_room_id",
-            "match_room_id VARCHAR(64) NULL AFTER match_ticket_id"
-        );
-        await ensureColumn(
-            db,
-            "user_study_session_summary",
-            "match_round_no",
-            "match_round_no INT NOT NULL DEFAULT 1 AFTER match_room_id"
-        );
-        await ensureColumn(
-            db,
-            "user_study_session_summary",
-            "matchmaking_opponent_user_id",
-            "matchmaking_opponent_user_id BIGINT NULL AFTER match_room_id"
-        );
-        await ensureColumn(
-            db,
-            "user_study_session_summary",
-            "matchmaking_opponent_type",
-            "matchmaking_opponent_type VARCHAR(16) NULL AFTER matchmaking_opponent_user_id"
-        );
-        await ensureColumn(
-            db,
-            "user_study_session_summary",
-            "matchmaking_opponent_name",
-            "matchmaking_opponent_name VARCHAR(64) NULL AFTER matchmaking_opponent_type"
-        );
-        await ensureColumn(
-            db,
-            "user_study_session_summary",
-            "actual_word_bank",
-            "actual_word_bank VARCHAR(32) NULL AFTER matchmaking_opponent_name"
-        );
-        await ensureColumn(
-            db,
-            "user_study_session_summary",
-            "winner_user_id",
-            "winner_user_id BIGINT NULL AFTER first_player"
-        );
-        await ensureIndex(
-            db,
-            "matchmaking_ticket",
-            "idx_matchmaking_ticket_waiting_order",
-            "(status, created_at, user_id, word_bank)"
-        );
+        if (sessionUser2Column[0]?.IS_NULLABLE !== "YES") {
+            throw new Error("Database migration required: user_study_session_summary.user2_id must allow NULL");
+        }
 
     })().catch(error => {
         schemaInitializationPromise = null;
@@ -407,7 +286,7 @@ async function loadCandidateTickets(executor, requesterUserId, limit = 20) {
          FROM matchmaking_ticket
          WHERE status = 'waiting'
            AND user_id <> ?
-         ORDER BY created_at ASC
+         ORDER BY created_at ASC, ticket_id ASC
          LIMIT ${safeLimit}
          FOR UPDATE`,
         [requesterUserId]
@@ -733,33 +612,32 @@ exports.enqueue = async (req, res) => {
             return res.status(400).json({ success: false, message: "user_id 无效" });
         }
 
-        const ticket = await withConnection(async connection => {
-            await connection.beginTransaction();
-            try {
-                let existingWaiting = await loadWaitingTicketByUser(connection, userId, true);
-                if (existingWaiting) {
-                    existingWaiting = await matchExistingWaitingWithHuman(connection, existingWaiting, timeoutMs);
-                    await connection.commit();
-                    return existingWaiting;
-                }
-
-                const matchedTicket = await matchWithHuman(connection, userId, wordBank);
-                if (matchedTicket) {
-                    await connection.commit();
-                    return matchedTicket;
-                }
-
-                const waitingTicket = await createWaitingTicket(connection, userId, wordBank, timeoutMs);
-                await connection.commit();
-                return waitingTicket;
-            } catch (error) {
-                await connection.rollback();
-                throw error;
+        const ticket = await withTransactionRetry(async connection => {
+            // Serialize enqueue requests for the same user so concurrent taps
+            // cannot create multiple active waiting tickets.
+            const [userRows] = await connection.execute(
+                "SELECT user_id FROM user_profile WHERE user_id = ? FOR UPDATE",
+                [userId]
+            );
+            if (userRows.length === 0) {
+                return null;
             }
+
+            let existingWaiting = await loadWaitingTicketByUser(connection, userId, true);
+            if (existingWaiting) {
+                return await matchExistingWaitingWithHuman(connection, existingWaiting, timeoutMs);
+            }
+
+            const matchedTicket = await matchWithHuman(connection, userId, wordBank);
+            if (matchedTicket) {
+                return matchedTicket;
+            }
+
+            return await createWaitingTicket(connection, userId, wordBank, timeoutMs);
         });
 
         if (!ticket) {
-            return res.status(500).json({ success: false, message: "创建匹配失败" });
+            return res.status(404).json({ success: false, message: "用户不存在" });
         }
 
         return res.json(ticket.status === "matched" ? buildMatchedResponse(ticket) : buildWaitingResponse(ticket));

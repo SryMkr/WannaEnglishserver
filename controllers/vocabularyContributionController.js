@@ -424,9 +424,9 @@ exports.searchWords = async (req, res) => {
                  v.origin,
                  v.word_type,
                  v.structure,
-                 GROUP_CONCAT(vlr.language_level_code ORDER BY vlr.language_level_code) AS language_level_codes
+                 vlr.language_level_codes
              FROM vocabulary v
-             LEFT JOIN vocabulary_language_relation vlr ON vlr.word_id = v.word_id
+             LEFT JOIN vocabulary_level_relation vlr ON vlr.word_id = v.word_id
              WHERE v.word_form LIKE CONCAT('%', ?, '%')
              GROUP BY v.word_id
              ORDER BY
@@ -607,18 +607,11 @@ async function applyApprovedContributionToVocabulary(connection, contribution) {
 
 async function replaceVocabularyLanguageRelations(connection, wordID, levelCodes) {
     await connection.execute(
-        "DELETE FROM vocabulary_language_relation WHERE word_id = ?",
-        [wordID]
-    );
-    if (levelCodes.length === 0) {
-        return;
-    }
-    const placeholders = levelCodes.map(() => "(?, ?)").join(", ");
-    const params = levelCodes.flatMap(levelCode => [wordID, levelCode]);
-    await connection.execute(
-        `INSERT INTO vocabulary_language_relation (word_id, language_level_code)
-         VALUES ${placeholders}`,
-        params
+        `INSERT INTO vocabulary_level_relation (word_id, language_level_codes)
+         VALUES (?, ?)
+         ON DUPLICATE KEY UPDATE
+             language_level_codes = VALUES(language_level_codes)`,
+        [wordID, JSON.stringify(levelCodes)]
     );
 }
 

@@ -47,6 +47,10 @@ exports.batchInsertActionLogs = async (req, res) => {
             return res.status(400).json({ error: "logs 不能为空" });
         }
 
+        if (logs.length > 200) {
+            return res.status(400).json({ error: "单次最多提交 200 条日志" });
+        }
+
         const actionNames = [...new Set(
             logs
                 .map((log) => log?.action_type_name)
@@ -55,6 +59,8 @@ exports.batchInsertActionLogs = async (req, res) => {
         const actionTypeMap = await getActionTypeMap(actionNames);
         const rowsToInsert = [];
         let skippedCount = 0;
+        const normalizedLogs = [];
+        const sessionIds = new Set();
 
         for (const log of logs) {
             if (!log || typeof log !== "object") {
@@ -72,7 +78,14 @@ exports.batchInsertActionLogs = async (req, res) => {
                 action_timestamp   // 🔥 Unity 传来的真实操作时间
             } = log;
 
-            if (!action_type_name || user_id == null || session_id == null || round_no == null) {
+            const numericUserId = Number(user_id);
+            const numericSessionId = Number(session_id);
+            if (!action_type_name ||
+                !Number.isInteger(numericUserId) ||
+                numericUserId <= 0 ||
+                !Number.isInteger(numericSessionId) ||
+                numericSessionId <= 0 ||
+                round_no == null) {
                 skippedCount++;
                 continue;
             }
@@ -89,15 +102,49 @@ exports.batchInsertActionLogs = async (req, res) => {
                 continue;
             }
 
-            rowsToInsert.push([
+            normalizedLogs.push({
                 actionTypeID,
-                user_id,
-                session_id,
-                numericRoundNo,
-                JSON.stringify(action_detail ?? {}),
-                context_state == null ? null : JSON.stringify(context_state),
-                fixTimestamp(action_timestamp) || getCurrentChinaDateTime6()
-            ]);
+                userId: numericUserId,
+                sessionId: numericSessionId,
+                roundNo: numericRoundNo,
+                actionDetail: action_detail,
+                contextState: context_state,
+                actionTimestamp: action_timestamp
+            });
+            sessionIds.add(numericSessionId);
+        }
+
+        if (normalizedLogs.length > 0) {
+            const sessionIdList = [...sessionIds];
+            const placeholders = sessionIdList.map(() => "?").join(", ");
+            const [sessionRows] = await db.query(
+                `SELECT session_id, user1_id, user2_id
+                 FROM user_study_session_summary
+                 WHERE session_id IN (${placeholders})`,
+                sessionIdList
+            );
+            const sessionsById = new Map(sessionRows.map(row => [Number(row.session_id), row]));
+
+            for (const log of normalizedLogs) {
+                const session = sessionsById.get(log.sessionId);
+                const isParticipant = session &&
+                    (Number(session.user1_id) === log.userId ||
+                        (session.user2_id != null && Number(session.user2_id) === log.userId));
+                if (!isParticipant) {
+                    skippedCount++;
+                    continue;
+                }
+
+                rowsToInsert.push([
+                    log.actionTypeID,
+                    log.userId,
+                    log.sessionId,
+                    log.roundNo,
+                    JSON.stringify(log.actionDetail ?? {}),
+                    log.contextState == null ? null : JSON.stringify(log.contextState),
+                    fixTimestamp(log.actionTimestamp) || getCurrentChinaDateTime6()
+                ]);
+            }
         }
 
         if (rowsToInsert.length === 0) {
@@ -143,6 +190,23 @@ exports.getRoomActionLogs = async (req, res) => {
 
         if (!Number.isInteger(viewerUserId) || viewerUserId <= 0) {
             return res.status(400).json({ success: false, message: "viewer_user_id 无效" });
+        }
+
+        const [roomRows] = await db.execute(
+            `SELECT room_id, opponent_type, user1_id, user2_id
+             FROM matchmaking_room
+             WHERE room_id = ?
+             LIMIT 1`,
+            [matchRoomId]
+        );
+        const room = roomRows[0];
+        if (!room) {
+            return res.status(404).json({ success: false, message: "房间不存在" });
+        }
+
+        if (room.opponent_type !== "human" ||
+            (Number(room.user1_id) !== viewerUserId && Number(room.user2_id) !== viewerUserId)) {
+            return res.status(403).json({ success: false, message: "你不在这个真人房间中" });
         }
 
         const matchRoundClause = matchRoundNo > 0 ? " AND usss.match_round_no = ?" : "";

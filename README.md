@@ -54,7 +54,7 @@ database/backend_feature_migration.sql
 
 ```text
 vocabulary
-vocabulary_language_relation
+vocabulary_level_relation
 prefix_code
 root_code
 suffix_code

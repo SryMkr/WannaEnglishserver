@@ -10,7 +10,6 @@ DROP TABLE IF EXISTS vocabulary_suffix_relation;
 DROP TABLE IF EXISTS vocabulary_root_relation;
 DROP TABLE IF EXISTS vocabulary_prefix_relation;
 DROP TABLE IF EXISTS vocabulary_level_relation;
-DROP TABLE IF EXISTS vocabulary_language_relation;
 DROP TABLE IF EXISTS vocabulary;
 DROP TABLE IF EXISTS suffix_code;
 DROP TABLE IF EXISTS root_code;

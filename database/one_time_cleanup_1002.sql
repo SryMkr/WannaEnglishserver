@@ -34,7 +34,7 @@ ORDER BY table_name;
 SELECT 'PROTECTED' AS phase, table_name, table_rows
 FROM (
     SELECT 'vocabulary', COUNT(*) AS table_rows FROM vocabulary
-    UNION ALL SELECT 'vocabulary_language_relation', COUNT(*) FROM vocabulary_language_relation
+    UNION ALL SELECT 'vocabulary_level_relation', COUNT(*) FROM vocabulary_level_relation
     UNION ALL SELECT 'language_level_code', COUNT(*) FROM language_level_code
     UNION ALL SELECT 'prefix_code', COUNT(*) FROM prefix_code
     UNION ALL SELECT 'root_code', COUNT(*) FROM root_code

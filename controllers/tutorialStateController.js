@@ -5,24 +5,37 @@ const ALLOWED_STATUSES = new Set(["seen", "completed", "skipped"]);
 
 let schemaReadyPromise = null;
 
+async function assertSchema() {
+    const requiredColumns = [
+        "user_id",
+        "tutorial_key",
+        "status",
+        "version",
+        "updated_at",
+        "created_at"
+    ];
+    const [rows] = await db.execute(
+        `SELECT COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'user_tutorial_state'
+           AND COLUMN_NAME IN (${requiredColumns.map(() => "?").join(", ")})`,
+        requiredColumns
+    );
+
+    if (rows.length !== requiredColumns.length) {
+        const present = new Set(rows.map(row => row.COLUMN_NAME));
+        const missing = requiredColumns.filter(column => !present.has(column));
+        throw new Error(`Database migration required: user_tutorial_state missing columns ${missing.join(", ")}`);
+    }
+}
+
 async function ensureSchema() {
     if (schemaReadyPromise) {
         return schemaReadyPromise;
     }
 
-    schemaReadyPromise = db.execute(
-        `CREATE TABLE IF NOT EXISTS user_tutorial_state (
-            user_id BIGINT NOT NULL,
-            tutorial_key VARCHAR(96) NOT NULL,
-            status VARCHAR(16) NOT NULL,
-            version VARCHAR(32) NULL,
-            updated_at DATETIME(6) NOT NULL,
-            created_at DATETIME(6) NOT NULL,
-            PRIMARY KEY (user_id, tutorial_key),
-            KEY idx_user_tutorial_state_status (status, updated_at),
-            CONSTRAINT fk_user_tutorial_state_user FOREIGN KEY (user_id) REFERENCES user_profile(user_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`
-    ).catch(error => {
+    schemaReadyPromise = assertSchema().catch(error => {
         schemaReadyPromise = null;
         throw error;
     });

@@ -29,6 +29,113 @@ function normalizeUserId(value) {
     return Number.isInteger(userId) && userId > 0 ? userId : null;
 }
 
+function requestError(message, statusCode = 400) {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    return error;
+}
+
+function normalizePositiveInteger(value, fallback = 1) {
+    if (value == null || value === "") {
+        return fallback;
+    }
+
+    const number = Number(value);
+    return Number.isInteger(number) && number > 0 ? number : null;
+}
+
+async function ensureUsersExist(userIds, executor = db) {
+    const uniqueUserIds = [...new Set(userIds.filter(userId => Number.isInteger(userId) && userId > 0))];
+    if (uniqueUserIds.length === 0) {
+        return false;
+    }
+
+    const placeholders = uniqueUserIds.map(() => "?").join(", ");
+    const [rows] = await executor.execute(
+        `SELECT user_id
+         FROM user_profile
+         WHERE user_id IN (${placeholders})`,
+        uniqueUserIds
+    );
+    return rows.length === uniqueUserIds.length;
+}
+
+async function validateHumanMatchReferences({
+    user1Id,
+    user2Id,
+    matchTicketId,
+    matchRoomId,
+    matchRoundNo
+}) {
+    if (!matchTicketId || !matchRoomId) {
+        throw requestError("真人对局缺少匹配票据或房间");
+    }
+
+    const [rows] = await db.execute(
+        `SELECT
+             t.ticket_id,
+             t.user_id AS ticket_user_id,
+             t.status AS ticket_status,
+             t.room_id AS ticket_room_id,
+             t.opponent_type AS ticket_opponent_type,
+             t.opponent_user_id AS ticket_opponent_user_id,
+             t.match_round_no AS ticket_round_no,
+             r.room_id,
+             r.room_status,
+             r.opponent_type AS room_opponent_type,
+             r.user1_id AS room_user1_id,
+             r.user2_id AS room_user2_id,
+             r.match_round_no AS room_round_no
+         FROM matchmaking_ticket t
+         INNER JOIN matchmaking_room r ON r.room_id = t.room_id
+         WHERE t.ticket_id = ?
+           AND r.room_id = ?
+         LIMIT 1`,
+        [matchTicketId, matchRoomId]
+    );
+    const row = rows[0];
+
+    if (!row ||
+        row.ticket_status !== "matched" ||
+        String(row.ticket_room_id) !== String(matchRoomId) ||
+        row.room_status !== "matched" ||
+        Number(row.ticket_user_id) !== Number(user1Id) ||
+        row.ticket_opponent_type !== "human" ||
+        row.room_opponent_type !== "human" ||
+        Number(row.ticket_opponent_user_id) !== Number(user2Id) ||
+        ![Number(row.room_user1_id), Number(row.room_user2_id)].includes(Number(user1Id)) ||
+        ![Number(row.room_user1_id), Number(row.room_user2_id)].includes(Number(user2Id)) ||
+        Number(row.room_user1_id) === Number(row.room_user2_id) ||
+        Number(row.ticket_round_no || 1) !== Number(matchRoundNo) ||
+        Number(row.room_round_no || 1) !== Number(matchRoundNo)) {
+        throw requestError("真人对局的房间、票据或对手不一致");
+    }
+
+    const [ticketRows] = await db.execute(
+        `SELECT user_id, opponent_user_id, opponent_type, match_round_no
+         FROM matchmaking_ticket
+         WHERE room_id = ?
+           AND status = 'matched'
+           AND user_id IN (?, ?)
+         ORDER BY user_id ASC`,
+        [matchRoomId, user1Id, user2Id]
+    );
+    const ticketsByUserId = new Map(ticketRows.map(ticket => [Number(ticket.user_id), ticket]));
+    const user1Ticket = ticketsByUserId.get(Number(user1Id));
+    const user2Ticket = ticketsByUserId.get(Number(user2Id));
+    if (ticketRows.length !== 2 ||
+        !user1Ticket ||
+        !user2Ticket ||
+        user1Ticket.opponent_type !== "human" ||
+        user2Ticket.opponent_type !== "human" ||
+        Number(user1Ticket.opponent_user_id) !== Number(user2Id) ||
+        Number(user2Ticket.opponent_user_id) !== Number(user1Id) ||
+        Number(user1Ticket.match_round_no || 1) !== Number(matchRoundNo) ||
+        Number(user2Ticket.match_round_no || 1) !== Number(matchRoundNo)) {
+        throw requestError("真人对局匹配票据不完整");
+    }
+}
+
 function formatStudyDate(date) {
     return formatChinaDate(date);
 }
@@ -276,17 +383,32 @@ exports.createStudySession = async (req, res) => {
             actual_word_bank
         } = req.body;
 
-        const normalizedUser1Id = Number(user1_id);
+        const normalizedUser1Id = normalizeUserId(user1_id);
         const opponentType = typeof matchmaking_opponent_type === "string"
             ? matchmaking_opponent_type.trim().toLowerCase()
             : "";
-        const normalizedUser2Id = opponentType === "bot" ? null : Number(user2_id);
+        const isBotMatch = opponentType === "bot" || play_mode === "match_bot";
+        const isHumanMatch = opponentType === "human" ||
+            play_mode === "match_human" ||
+            match_ticket_id != null ||
+            match_room_id != null;
+        const normalizedUser2Id = isBotMatch ? null : normalizeUserId(user2_id);
+        const normalizedOpponentUserId = isBotMatch
+            ? null
+            : normalizeUserId(matchmaking_opponent_user_id ?? user2_id);
 
-        if (!Number.isInteger(normalizedUser1Id) || normalizedUser1Id <= 0 ||
-            (opponentType !== "bot" &&
-                (!Number.isInteger(normalizedUser2Id) || normalizedUser2Id <= 0)) ||
+        if (normalizedUser1Id == null ||
+            (opponentType && !["human", "bot"].includes(opponentType)) ||
+            (!isBotMatch && normalizedUser2Id == null) ||
+            (!isBotMatch && normalizedUser2Id === normalizedUser1Id) ||
             !word) {
             return res.status(400).json({ message: "Missing parameters" });
+        }
+
+        if (!await ensureUsersExist(
+            isBotMatch ? [normalizedUser1Id] : [normalizedUser1Id, normalizedUser2Id]
+        )) {
+            return res.status(400).json({ message: "Unknown user" });
         }
 
         const word_id = await getWordId(word);
@@ -294,7 +416,28 @@ exports.createStudySession = async (req, res) => {
             return res.status(400).json({ error: "Unknown word: " + word });
         }
 
-        const normalizedMatchRoundNo = Math.max(1, Number(match_round_no) || 1);
+        const normalizedMatchRoundNo = normalizePositiveInteger(match_round_no);
+        if (normalizedMatchRoundNo == null) {
+            return res.status(400).json({ message: "Invalid match_round_no" });
+        }
+
+        if (isHumanMatch) {
+            if (isBotMatch || opponentType !== "human") {
+                return res.status(400).json({ message: "真人对局 opponent_type 无效" });
+            }
+
+            if (normalizedOpponentUserId !== normalizedUser2Id) {
+                return res.status(400).json({ message: "真人对局对手用户不一致" });
+            }
+
+            await validateHumanMatchReferences({
+                user1Id: normalizedUser1Id,
+                user2Id: normalizedUser2Id,
+                matchTicketId: typeof match_ticket_id === "string" ? match_ticket_id.trim() : "",
+                matchRoomId: typeof match_room_id === "string" ? match_room_id.trim() : "",
+                matchRoundNo: normalizedMatchRoundNo
+            });
+        }
 
         const [result] = await db.query(
             `INSERT INTO user_study_session_summary 
@@ -309,7 +452,7 @@ exports.createStudySession = async (req, res) => {
                 match_ticket_id ?? null,
                 match_room_id ?? null,
                 normalizedMatchRoundNo,
-                opponentType === "bot" ? null : (matchmaking_opponent_user_id ?? normalizedUser2Id),
+                isBotMatch ? null : normalizedOpponentUserId,
                 opponentType || null,
                 matchmaking_opponent_name ?? null,
                 normalizeWordBank(actual_word_bank)
@@ -324,6 +467,10 @@ exports.createStudySession = async (req, res) => {
 
     } catch (err) {
         console.error("createStudySession Error:", err);
+
+        if (err.statusCode) {
+            return res.status(err.statusCode).json({ message: err.message });
+        }
 
         if (err.code === "ER_NO_REFERENCED_ROW_2") {
             return res.status(400).json({ message: "Unknown user or word" });
@@ -374,11 +521,11 @@ exports.searchStudyWord = async (req, res) => {
                  v.detail,
                  v.word_type,
                  ll.language_level_name AS word_bank,
-                 vlr.language_level_code
+                 CAST(JSON_UNQUOTE(JSON_EXTRACT(vlr.language_level_codes, '$[0]')) AS UNSIGNED) AS language_level_code
              FROM vocabulary v
-             LEFT JOIN vocabulary_language_relation vlr ON vlr.word_id = v.word_id
+             LEFT JOIN vocabulary_level_relation vlr ON vlr.word_id = v.word_id
              LEFT JOIN language_level_code ll
-                 ON ll.language_level_code = vlr.language_level_code
+                 ON ll.language_level_code = CAST(JSON_UNQUOTE(JSON_EXTRACT(vlr.language_level_codes, '$[0]')) AS UNSIGNED)
              WHERE LOWER(v.word_form) = LOWER(?)
              LIMIT 1`,
             [query]
@@ -455,7 +602,8 @@ exports.finishStudySession = async (req, res) => {
             game_status
         } = req.body;
 
-        if (session_id == null) {
+        const numericSessionId = Number(session_id);
+        if (!Number.isInteger(numericSessionId) || numericSessionId <= 0) {
             return res.status(400).json({ message: "Missing session_id" });
         }
 
@@ -464,7 +612,7 @@ exports.finishStudySession = async (req, res) => {
         const numericDuration = duration == null ? null : Number(duration);
         const numericGameStatus = game_status == null ? null : Number(game_status);
 
-        if (numericFirstPlayer != null && !Number.isInteger(numericFirstPlayer)) {
+        if (numericFirstPlayer != null && (!Number.isInteger(numericFirstPlayer) || numericFirstPlayer <= 0)) {
             return res.status(400).json({ message: "Invalid first_player" });
         }
 
@@ -476,35 +624,104 @@ exports.finishStudySession = async (req, res) => {
             return res.status(400).json({ message: "Invalid winner_user_id" });
         }
 
-        if (numericGameStatus != null && !Number.isInteger(numericGameStatus)) {
+        if (numericGameStatus != null && ![0, 1].includes(numericGameStatus)) {
             return res.status(400).json({ message: "Invalid game_status" });
         }
 
-        const [result] = await db.query(
-            `UPDATE user_study_session_summary SET
-                player1_card = ?, 
-                player2_card = ?, 
-                first_player = ?, 
-                winner_user_id = ?,
-                duration = ?, 
-                game_status = ?
-            WHERE session_id = ?`,
-            [
-                player1_card ?? null,
-                player2_card ?? null,
-                numericFirstPlayer,
-                numericWinnerUserId,
-                numericDuration,
-                numericGameStatus,
-                session_id
-            ]
-        );
+        const connection = await db.getConnection();
+        try {
+            await connection.beginTransaction();
 
-        if (result.affectedRows === 0) {
-            return res.status(404).json({ message: "Session not found" });
+            const [sessionRows] = await connection.execute(
+                `SELECT session_id, user1_id, user2_id, player1_card, player2_card,
+                        first_player, winner_user_id, duration, game_status
+                 FROM user_study_session_summary
+                 WHERE session_id = ?
+                 FOR UPDATE`,
+                [numericSessionId]
+            );
+            const session = sessionRows[0];
+            if (!session) {
+                await connection.rollback();
+                return res.status(404).json({ message: "Session not found" });
+            }
+
+            const participantIds = [Number(session.user1_id)];
+            if (session.user2_id != null) {
+                participantIds.push(Number(session.user2_id));
+            }
+
+            if (numericFirstPlayer != null && !participantIds.includes(numericFirstPlayer)) {
+                await connection.rollback();
+                return res.status(400).json({ message: "Invalid first_player" });
+            }
+
+            if (numericWinnerUserId != null && !participantIds.includes(numericWinnerUserId)) {
+                await connection.rollback();
+                return res.status(400).json({ message: "Invalid winner_user_id" });
+            }
+
+            const incoming = {
+                player1_card: Object.prototype.hasOwnProperty.call(req.body, "player1_card")
+                    ? player1_card ?? null
+                    : session.player1_card,
+                player2_card: Object.prototype.hasOwnProperty.call(req.body, "player2_card")
+                    ? player2_card ?? null
+                    : session.player2_card,
+                first_player: Object.prototype.hasOwnProperty.call(req.body, "first_player")
+                    ? numericFirstPlayer
+                    : session.first_player,
+                winner_user_id: Object.prototype.hasOwnProperty.call(req.body, "winner_user_id")
+                    ? numericWinnerUserId
+                    : session.winner_user_id,
+                duration: Object.prototype.hasOwnProperty.call(req.body, "duration")
+                    ? numericDuration
+                    : session.duration,
+                game_status: Object.prototype.hasOwnProperty.call(req.body, "game_status")
+                    ? numericGameStatus
+                    : session.game_status
+            };
+
+            const resultFields = Object.keys(incoming);
+            const hasConflict = resultFields.some(field => {
+                const storedValue = session[field];
+                const incomingValue = incoming[field];
+                return storedValue != null &&
+                    (incomingValue == null || String(storedValue) !== String(incomingValue));
+            });
+            if (hasConflict) {
+                await connection.rollback();
+                return res.status(409).json({ message: "Session result already recorded differently" });
+            }
+
+            await connection.execute(
+                `UPDATE user_study_session_summary SET
+                    player1_card = ?,
+                    player2_card = ?,
+                    first_player = ?,
+                    winner_user_id = ?,
+                    duration = ?,
+                    game_status = ?
+                 WHERE session_id = ?`,
+                [
+                    incoming.player1_card,
+                    incoming.player2_card,
+                    incoming.first_player,
+                    incoming.winner_user_id,
+                    incoming.duration,
+                    incoming.game_status,
+                    numericSessionId
+                ]
+            );
+
+            await connection.commit();
+            return res.json({ success: true });
+        } catch (error) {
+            await connection.rollback();
+            throw error;
+        } finally {
+            connection.release();
         }
-
-        return res.json({ success: true });
 
     } catch (err) {
         console.error("finishStudySession Error:", err);

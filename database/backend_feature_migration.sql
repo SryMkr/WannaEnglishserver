@@ -4,68 +4,8 @@
 -- Scope:
 -- 1. Business tables only: matchmaking, custom training words, mode entry, tutorial state, remote config events.
 -- 2. Protected word-base tables are not deleted, rebuilt, or rewritten:
---    vocabulary, vocabulary_language_relation, prefix_code, root_code, suffix_code, language_level_code.
+--    vocabulary, vocabulary_level_relation, prefix_code, root_code, suffix_code, language_level_code.
 -- 3. Idempotent for production: safe to run more than once.
-
-CREATE TABLE IF NOT EXISTS vocabulary_language_relation (
-    word_id INT NOT NULL,
-    language_level_code INT NOT NULL,
-    PRIMARY KEY (word_id, language_level_code),
-    KEY idx_vocabulary_language_relation_level (language_level_code, word_id),
-    CONSTRAINT vocabulary_language_relation_fk_word
-        FOREIGN KEY (word_id) REFERENCES vocabulary(word_id) ON DELETE CASCADE,
-    CONSTRAINT vocabulary_language_relation_fk_level
-        FOREIGN KEY (language_level_code) REFERENCES language_level_code(language_level_code)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- One-time legacy conversion. It is intentionally guarded and does not touch
--- vocabulary rows. Run the script once after reviewing its preview counts.
-SET @legacy_relation_exists = (
-    SELECT COUNT(*)
-    FROM INFORMATION_SCHEMA.TABLES
-    WHERE TABLE_SCHEMA = DATABASE()
-      AND TABLE_NAME = 'vocabulary_level_relation'
-);
-SET @legacy_relation_count = IFNULL((
-    SELECT COUNT(*) FROM vocabulary_level_relation
-), 0);
-SET @normalized_relation_count = (
-    SELECT COUNT(*) FROM vocabulary_language_relation
-);
-SET @copy_legacy_relations_sql = IF(
-    @legacy_relation_exists = 1 AND @legacy_relation_count > 0
-        AND @normalized_relation_count = 0,
-    'INSERT IGNORE INTO vocabulary_language_relation (word_id, language_level_code)
-     SELECT vlr.word_id,
-            CAST(jt.language_level_code AS UNSIGNED)
-     FROM vocabulary_level_relation vlr
-     JOIN JSON_TABLE(
-         vlr.language_level_codes,
-         ''$[*]'' COLUMNS(language_level_code VARCHAR(16) PATH ''$'')
-     ) jt
-     JOIN language_level_code ll
-       ON ll.language_level_code = CAST(jt.language_level_code AS UNSIGNED)',
-    'DO 0'
-);
-PREPARE stmt FROM @copy_legacy_relations_sql;
-EXECUTE stmt;
-DEALLOCATE PREPARE stmt;
-
--- Once the normalized table has been reviewed, remove the JSON table so there
--- is only one vocabulary relationship source.
-SET @drop_legacy_relation_sql = IF(
-    @legacy_relation_exists = 1
-        AND (
-            SELECT COUNT(*) FROM vocabulary_level_relation
-        ) = (
-            SELECT COUNT(DISTINCT word_id) FROM vocabulary_language_relation
-        ),
-    'DROP TABLE vocabulary_level_relation',
-    'DO 0'
-);
-PREPARE stmt FROM @drop_legacy_relation_sql;
-EXECUTE stmt;
-DEALLOCATE PREPARE stmt;
 
 CREATE TABLE IF NOT EXISTS matchmaking_room (
     room_id VARCHAR(64) PRIMARY KEY,
@@ -115,6 +55,32 @@ CREATE TABLE IF NOT EXISTS matchmaking_ticket (
     CONSTRAINT fk_matchmaking_ticket_user FOREIGN KEY (user_id) REFERENCES user_profile(user_id),
     CONSTRAINT fk_matchmaking_ticket_opponent_user FOREIGN KEY (opponent_user_id) REFERENCES user_profile(user_id),
     CONSTRAINT fk_matchmaking_ticket_room FOREIGN KEY (room_id) REFERENCES matchmaking_room(room_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS friend_room (
+    invite_id VARCHAR(64) PRIMARY KEY,
+    room_code VARCHAR(8) NOT NULL,
+    host_user_id BIGINT NOT NULL,
+    guest_user_id BIGINT NULL,
+    word_bank VARCHAR(32) NULL,
+    language_level_code INT NOT NULL DEFAULT 0,
+    host_ready TINYINT(1) NOT NULL DEFAULT 0,
+    guest_ready TINYINT(1) NOT NULL DEFAULT 0,
+    status VARCHAR(16) NOT NULL DEFAULT 'waiting',
+    match_room_id VARCHAR(64) NULL,
+    match_round_no INT NOT NULL DEFAULT 1,
+    host_ticket_id VARCHAR(64) NULL,
+    guest_ticket_id VARCHAR(64) NULL,
+    matched_word VARCHAR(64) NULL,
+    expires_at DATETIME(3) NOT NULL,
+    created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    UNIQUE KEY uk_friend_room_code (room_code),
+    KEY idx_friend_room_host_status (host_user_id, status, created_at),
+    KEY idx_friend_room_guest_status (guest_user_id, status, created_at),
+    KEY idx_friend_room_status_expires (status, expires_at),
+    CONSTRAINT fk_friend_room_host FOREIGN KEY (host_user_id) REFERENCES user_profile(user_id),
+    CONSTRAINT fk_friend_room_guest FOREIGN KEY (guest_user_id) REFERENCES user_profile(user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS user_custom_training_word (
@@ -201,10 +167,242 @@ CREATE TABLE IF NOT EXISTS user_study_session_summary (
     KEY idx_user_study_session_match_room (match_room_id, played_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Older friend_room tables may be missing either linkage or base lifecycle
+-- fields. CREATE TABLE IF NOT EXISTS does not add missing columns.
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'friend_room' AND COLUMN_NAME = 'invite_id'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN invite_id VARCHAR(64) NULL FIRST')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'friend_room' AND COLUMN_NAME = 'room_code'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN room_code VARCHAR(8) NULL AFTER invite_id')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'friend_room' AND COLUMN_NAME = 'host_user_id'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN host_user_id BIGINT NULL AFTER room_code')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'friend_room' AND COLUMN_NAME = 'guest_user_id'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN guest_user_id BIGINT NULL AFTER host_user_id')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'friend_room' AND COLUMN_NAME = 'word_bank'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN word_bank VARCHAR(32) NULL AFTER guest_user_id')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'friend_room' AND COLUMN_NAME = 'language_level_code'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN language_level_code INT NOT NULL DEFAULT 0 AFTER word_bank')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'friend_room' AND COLUMN_NAME = 'host_ready'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN host_ready TINYINT(1) NOT NULL DEFAULT 0 AFTER language_level_code')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'friend_room' AND COLUMN_NAME = 'guest_ready'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN guest_ready TINYINT(1) NOT NULL DEFAULT 0 AFTER host_ready')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'friend_room' AND COLUMN_NAME = 'status'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT ''waiting'' AFTER guest_ready')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'friend_room'
+          AND COLUMN_NAME = 'match_room_id'
+    ),
+        'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN match_room_id VARCHAR(64) NULL AFTER status')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'friend_room'
+          AND COLUMN_NAME = 'match_round_no'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN match_round_no INT NOT NULL DEFAULT 1 AFTER match_room_id')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'friend_room'
+          AND COLUMN_NAME = 'host_ticket_id'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN host_ticket_id VARCHAR(64) NULL AFTER match_round_no')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'friend_room'
+          AND COLUMN_NAME = 'guest_ticket_id'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN guest_ticket_id VARCHAR(64) NULL AFTER host_ticket_id')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'friend_room'
+          AND COLUMN_NAME = 'matched_word'
+    ),
+        'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN matched_word VARCHAR(64) NULL AFTER guest_ticket_id')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'friend_room' AND COLUMN_NAME = 'expires_at'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN expires_at DATETIME(3) NULL AFTER matched_word')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'friend_room' AND COLUMN_NAME = 'created_at'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN created_at DATETIME(3) NULL DEFAULT CURRENT_TIMESTAMP(3) AFTER expires_at')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'friend_room' AND COLUMN_NAME = 'updated_at'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD COLUMN updated_at DATETIME(3) NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3) AFTER created_at')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'friend_room' AND INDEX_NAME = 'uk_friend_room_invite'
+    ), 'SELECT 1',
+        'ALTER TABLE friend_room ADD UNIQUE INDEX uk_friend_room_invite (invite_id)')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1
+        FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'friend_room'
+          AND INDEX_NAME = 'uk_friend_room_code'
+    ),
+        'SELECT 1',
+        'ALTER TABLE friend_room ADD UNIQUE INDEX uk_friend_room_code (room_code)')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1
+        FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'friend_room'
+          AND INDEX_NAME = 'idx_friend_room_host_status'
+    ),
+        'SELECT 1',
+        'ALTER TABLE friend_room ADD INDEX idx_friend_room_host_status (host_user_id, status, created_at)')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1
+        FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'friend_room'
+          AND INDEX_NAME = 'idx_friend_room_guest_status'
+    ),
+        'SELECT 1',
+        'ALTER TABLE friend_room ADD INDEX idx_friend_room_guest_status (guest_user_id, status, created_at)')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql = (
+    SELECT IF(EXISTS(
+        SELECT 1
+        FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'friend_room'
+          AND INDEX_NAME = 'idx_friend_room_status_expires'
+    ),
+        'SELECT 1',
+        'ALTER TABLE friend_room ADD INDEX idx_friend_room_status_expires (status, expires_at)')
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
 -- Existing-table column backfill. CREATE TABLE IF NOT EXISTS does not add missing columns.
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'matchmaking_room' AND COLUMN_NAME = 'match_round_no'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE matchmaking_room ADD COLUMN match_round_no INT NOT NULL DEFAULT 1 AFTER matched_word')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
@@ -219,7 +417,7 @@ SET @sql = (
               AND COLUMN_NAME = 'user2_id'
               AND IS_NULLABLE = 'YES'
         ),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE user_study_session_summary MODIFY COLUMN user2_id BIGINT NULL'
     )
 );
@@ -227,190 +425,176 @@ PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'matchmaking_room' AND COLUMN_NAME = 'user1_last_seen_at'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE matchmaking_room ADD COLUMN user1_last_seen_at DATETIME(3) NULL AFTER user2_id')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'matchmaking_room' AND COLUMN_NAME = 'user2_last_seen_at'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE matchmaking_room ADD COLUMN user2_last_seen_at DATETIME(3) NULL AFTER user1_last_seen_at')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'matchmaking_room' AND COLUMN_NAME = 'user1_rematch_round_no'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE matchmaking_room ADD COLUMN user1_rematch_round_no INT NOT NULL DEFAULT 0 AFTER user2_last_seen_at')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'matchmaking_room' AND COLUMN_NAME = 'user2_rematch_round_no'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE matchmaking_room ADD COLUMN user2_rematch_round_no INT NOT NULL DEFAULT 0 AFTER user1_rematch_round_no')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'matchmaking_room' AND COLUMN_NAME = 'rematch_requested_at'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE matchmaking_room ADD COLUMN rematch_requested_at DATETIME(3) NULL AFTER user2_rematch_round_no')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'matchmaking_ticket' AND COLUMN_NAME = 'matched_word_bank'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE matchmaking_ticket ADD COLUMN matched_word_bank VARCHAR(32) NULL AFTER word_bank')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'matchmaking_ticket' AND COLUMN_NAME = 'allow_bot_fallback'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE matchmaking_ticket ADD COLUMN allow_bot_fallback TINYINT(1) NOT NULL DEFAULT 0 AFTER matched_word_bank')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'matchmaking_ticket' AND COLUMN_NAME = 'match_round_no'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE matchmaking_ticket ADD COLUMN match_round_no INT NOT NULL DEFAULT 1 AFTER matched_word')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_study_session_summary' AND COLUMN_NAME = 'play_mode'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE user_study_session_summary ADD COLUMN play_mode VARCHAR(32) NULL AFTER word_id')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_study_session_summary' AND COLUMN_NAME = 'match_ticket_id'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE user_study_session_summary ADD COLUMN match_ticket_id VARCHAR(64) NULL AFTER play_mode')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_study_session_summary' AND COLUMN_NAME = 'match_room_id'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE user_study_session_summary ADD COLUMN match_room_id VARCHAR(64) NULL AFTER match_ticket_id')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_study_session_summary' AND COLUMN_NAME = 'match_round_no'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE user_study_session_summary ADD COLUMN match_round_no INT NOT NULL DEFAULT 1 AFTER match_room_id')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_study_session_summary' AND COLUMN_NAME = 'matchmaking_opponent_user_id'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE user_study_session_summary ADD COLUMN matchmaking_opponent_user_id BIGINT NULL AFTER match_room_id')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_study_session_summary' AND COLUMN_NAME = 'matchmaking_opponent_type'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE user_study_session_summary ADD COLUMN matchmaking_opponent_type VARCHAR(16) NULL AFTER matchmaking_opponent_user_id')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_study_session_summary' AND COLUMN_NAME = 'matchmaking_opponent_name'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE user_study_session_summary ADD COLUMN matchmaking_opponent_name VARCHAR(64) NULL AFTER matchmaking_opponent_type')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_study_session_summary' AND COLUMN_NAME = 'actual_word_bank'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE user_study_session_summary ADD COLUMN actual_word_bank VARCHAR(32) NULL AFTER matchmaking_opponent_name')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_study_session_summary' AND COLUMN_NAME = 'winner_user_id'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE user_study_session_summary ADD COLUMN winner_user_id BIGINT NULL AFTER first_player')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
--- Existing allow_bot_fallback default must match the no-bot-fallback policy.
-ALTER TABLE matchmaking_ticket ALTER COLUMN allow_bot_fallback SET DEFAULT 0;
-
--- Human matchmaking must not fallback to bots.
-UPDATE matchmaking_ticket
-SET allow_bot_fallback = 0
-WHERE status = 'waiting'
-  AND allow_bot_fallback <> 0;
+-- Keep the fallback flag default disabled without rewriting existing tickets.
+SET @sql = (
+    SELECT IF(
+        COLUMN_DEFAULT = '0',
+        'SELECT 1',
+        'ALTER TABLE matchmaking_ticket ALTER COLUMN allow_bot_fallback SET DEFAULT 0'
+    )
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'matchmaking_ticket'
+      AND COLUMN_NAME = 'allow_bot_fallback'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 -- Indexes for human waiting queue and existing lookup paths.
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'matchmaking_ticket' AND INDEX_NAME = 'idx_matchmaking_ticket_waiting_order'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE matchmaking_ticket ADD INDEX idx_matchmaking_ticket_waiting_order (status, created_at, user_id, word_bank)')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'matchmaking_ticket' AND INDEX_NAME = 'idx_matchmaking_ticket_status_time'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE matchmaking_ticket ADD INDEX idx_matchmaking_ticket_status_time (status, fallback_at, created_at)')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'matchmaking_ticket' AND INDEX_NAME = 'idx_matchmaking_ticket_user_status'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE matchmaking_ticket ADD INDEX idx_matchmaking_ticket_user_status (user_id, status, created_at)')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_study_session_summary' AND INDEX_NAME = 'idx_competitive_leaderboard_filter'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE user_study_session_summary ADD INDEX idx_competitive_leaderboard_filter (play_mode, game_status, actual_word_bank, played_at, winner_user_id)')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 SET @sql = (
     SELECT IF(EXISTS(SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'user_study_session_summary' AND INDEX_NAME = 'idx_competitive_leaderboard_room'),
-        'DO 0',
+        'SELECT 1',
         'ALTER TABLE user_study_session_summary ADD INDEX idx_competitive_leaderboard_room (match_room_id, played_at)')
 );
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
--- Keep only first 7 custom training words per user.
--- MySQL 5.7/8 compatible: no window functions.
-DELETE uctw
-FROM user_custom_training_word uctw
-JOIN (
-    SELECT current_word.user_id, current_word.word_id
-    FROM user_custom_training_word current_word
-    JOIN user_custom_training_word earlier_word
-      ON earlier_word.user_id = current_word.user_id
-     AND (
-        earlier_word.sort_order < current_word.sort_order
-        OR (earlier_word.sort_order = current_word.sort_order AND earlier_word.updated_at > current_word.updated_at)
-        OR (earlier_word.sort_order = current_word.sort_order AND earlier_word.updated_at = current_word.updated_at AND earlier_word.word_id < current_word.word_id)
-     )
-    GROUP BY current_word.user_id, current_word.word_id
-    HAVING COUNT(*) >= 7
-) over_limit
-  ON over_limit.user_id = uctw.user_id
- AND over_limit.word_id = uctw.word_id;
-
 SELECT 'after:matchmaking_ticket' AS table_name, COUNT(*) AS row_count FROM matchmaking_ticket;
 SELECT 'after:matchmaking_room' AS table_name, COUNT(*) AS row_count FROM matchmaking_room;
+SELECT 'after:friend_room' AS table_name, COUNT(*) AS row_count FROM friend_room;
 SELECT 'after:user_custom_training_word' AS table_name, COUNT(*) AS row_count FROM user_custom_training_word;
 SELECT 'after:user_mode_entry_event' AS table_name, COUNT(*) AS row_count FROM user_mode_entry_event;
 SELECT 'after:user_tutorial_state' AS table_name, COUNT(*) AS row_count FROM user_tutorial_state;

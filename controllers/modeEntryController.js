@@ -12,26 +12,39 @@ const ALLOWED_ENTRY_MODES = new Set([
 
 let schemaReadyPromise = null;
 
+async function assertSchema() {
+    const requiredColumns = [
+        "event_id",
+        "user_id",
+        "entry_mode",
+        "word_bank",
+        "source",
+        "client_time",
+        "detail_json",
+        "created_at"
+    ];
+    const [rows] = await db.execute(
+        `SELECT COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'user_mode_entry_event'
+           AND COLUMN_NAME IN (${requiredColumns.map(() => "?").join(", ")})`,
+        requiredColumns
+    );
+
+    if (rows.length !== requiredColumns.length) {
+        const present = new Set(rows.map(row => row.COLUMN_NAME));
+        const missing = requiredColumns.filter(column => !present.has(column));
+        throw new Error(`Database migration required: user_mode_entry_event missing columns ${missing.join(", ")}`);
+    }
+}
+
 async function ensureSchema() {
     if (schemaReadyPromise) {
         return schemaReadyPromise;
     }
 
-    schemaReadyPromise = db.execute(
-        `CREATE TABLE IF NOT EXISTS user_mode_entry_event (
-            event_id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            entry_mode VARCHAR(32) NOT NULL,
-            word_bank VARCHAR(32) NULL,
-            source VARCHAR(64) NULL,
-            client_time DATETIME(6) NULL,
-            detail_json JSON NULL,
-            created_at DATETIME(6) NOT NULL,
-            KEY idx_user_mode_entry_user_time (user_id, created_at),
-            KEY idx_user_mode_entry_mode_time (entry_mode, created_at),
-            CONSTRAINT fk_user_mode_entry_user FOREIGN KEY (user_id) REFERENCES user_profile(user_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`
-    ).catch(error => {
+    schemaReadyPromise = assertSchema().catch(error => {
         schemaReadyPromise = null;
         throw error;
     });

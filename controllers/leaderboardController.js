@@ -56,7 +56,7 @@ function buildWindowClause(period) {
     };
 }
 
-function buildWordBankClause(wordBankFilter, currentWordBank) {
+function buildWordBankClause(wordBankFilter, currentWordBank, tableAlias = "s") {
     if (wordBankFilter !== "current") {
         return { sql: "", params: [] };
     }
@@ -67,23 +67,34 @@ function buildWordBankClause(wordBankFilter, currentWordBank) {
     }
 
     return {
-        sql: "AND COALESCE(s.actual_word_bank, mt.matched_word_bank) = ?",
+        sql: `AND COALESCE(
+            ${tableAlias}.actual_word_bank,
+            (
+                SELECT mt.matched_word_bank
+                FROM matchmaking_ticket mt
+                WHERE mt.room_id = ${tableAlias}.match_room_id
+                  AND mt.matched_word_bank IS NOT NULL
+                ORDER BY mt.updated_at DESC, mt.ticket_id ASC
+                LIMIT 1
+            )
+        ) = ?`,
         params: [normalizedWordBank]
     };
 }
 
-function buildBaseQuery(period, wordBankFilter, currentWordBank) {
+function buildBaseQuery(period, wordBankFilter, currentWordBank, tableAlias = "s") {
     const windowClause = buildWindowClause(period);
-    const wordBankClause = buildWordBankClause(wordBankFilter, currentWordBank);
+    const wordBankClause = buildWordBankClause(wordBankFilter, currentWordBank, tableAlias);
 
     return {
         whereSql: `
-            s.play_mode = 'match_human'
-            AND s.game_status = 1
-            AND s.winner_user_id IS NOT NULL
-            AND s.user1_id > 0
-            AND s.user2_id > 0
-            ${windowClause.sql}
+            ${tableAlias}.play_mode = 'match_human'
+            AND COALESCE(${tableAlias}.matchmaking_opponent_type, 'human') = 'human'
+            AND ${tableAlias}.game_status = 1
+            AND ${tableAlias}.winner_user_id IS NOT NULL
+            AND ${tableAlias}.user1_id > 0
+            AND ${tableAlias}.user2_id > 0
+            ${windowClause.sql.replaceAll("s.", `${tableAlias}.`)}
             ${wordBankClause.sql}
         `,
         params: [
@@ -112,6 +123,7 @@ function toLeaderboardRow(row) {
 
 async function queryLeaderboard(period, wordBankFilter, currentWordBank, userId) {
     const base = buildBaseQuery(period, wordBankFilter, currentWordBank);
+    const representative = buildBaseQuery(period, wordBankFilter, currentWordBank, "s2");
 
     const sql = `
         SELECT
@@ -127,15 +139,27 @@ async function queryLeaderboard(period, wordBankFilter, currentWordBank, userId)
             up2.wechat_nickname AS user2_nickname,
             up2.avatar_url AS user2_avatar_url
         FROM user_study_session_summary s
-        LEFT JOIN matchmaking_ticket mt ON mt.room_id = s.match_room_id
         INNER JOIN user_profile up1 ON up1.user_id = s.user1_id
         INNER JOIN user_profile up2 ON up2.user_id = s.user2_id
         WHERE ${base.whereSql}
+          AND NOT EXISTS (
+              SELECT 1
+              FROM user_study_session_summary s2
+              WHERE COALESCE(s2.match_room_id, CONCAT('session:', s2.session_id))
+                    = COALESCE(s.match_room_id, CONCAT('session:', s.session_id))
+                AND (
+                    s2.played_at < s.played_at
+                    OR (
+                        s2.played_at = s.played_at
+                        AND s2.session_id < s.session_id
+                    )
+                )
+                AND ${representative.whereSql}
+          )
         ORDER BY s.played_at ASC, s.session_id ASC
     `;
 
-    const [sessions] = await db.execute(sql, base.params);
-    const seenMatchKeys = new Set();
+    const [sessions] = await db.execute(sql, [...base.params, ...representative.params]);
     const statsByUserId = new Map();
 
     function ensureStats(participantUserId, displayName, avatarUrl) {
@@ -160,12 +184,6 @@ async function queryLeaderboard(period, wordBankFilter, currentWordBank, userId)
     }
 
     for (const session of sessions) {
-        const matchKey = session.match_key || `session:${session.session_id}`;
-        if (seenMatchKeys.has(matchKey)) {
-            continue;
-        }
-        seenMatchKeys.add(matchKey);
-
         const participants = [
             { userId: session.user1_id, nickname: session.user1_nickname, avatarUrl: session.user1_avatar_url },
             { userId: session.user2_id, nickname: session.user2_nickname, avatarUrl: session.user2_avatar_url }

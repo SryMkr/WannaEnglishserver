@@ -12,7 +12,6 @@ const { formatChinaIsoDateTime } = require("../services/timeService");
 
 const ROOM_TTL_MINUTES = Math.max(5, Number(process.env.FRIEND_ROOM_TTL_MINUTES) || 30);
 
-let roomSequence = 0;
 let schemaInitializationPromise = null;
 
 function normalizeUserId(value) {
@@ -25,8 +24,7 @@ function buildInviteId() {
 }
 
 function buildRoomId() {
-    roomSequence += 1;
-    return `room_${Date.now()}_${roomSequence}`;
+    return `room_${Date.now()}_${crypto.randomBytes(8).toString("hex")}`;
 }
 
 function buildTicketId() {
@@ -114,67 +112,59 @@ function buildRoomResponse(row, currentUserId, message = null) {
     };
 }
 
-async function hasColumn(executor, tableName, columnName) {
-    const [rows] = await executor.execute(
-        `SELECT 1
-         FROM INFORMATION_SCHEMA.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE()
-           AND TABLE_NAME = ?
-           AND COLUMN_NAME = ?
-         LIMIT 1`,
-        [tableName, columnName]
-    );
-
-    return rows.length > 0;
-}
-
-async function ensureColumn(executor, tableName, columnName, definitionSql) {
-    if (await hasColumn(executor, tableName, columnName)) {
-        return;
-    }
-
-    await executor.execute(`ALTER TABLE ${tableName} ADD COLUMN ${definitionSql}`);
-}
-
 async function initializeFriendRoomSchema() {
     if (schemaInitializationPromise != null) {
         return schemaInitializationPromise;
     }
 
     schemaInitializationPromise = (async () => {
-        await db.execute(
-            `CREATE TABLE IF NOT EXISTS friend_room (
-                invite_id VARCHAR(64) PRIMARY KEY,
-                room_code VARCHAR(8) NOT NULL,
-                host_user_id BIGINT NOT NULL,
-                guest_user_id BIGINT NULL,
-                word_bank VARCHAR(32) NULL,
-                language_level_code INT NOT NULL DEFAULT 0,
-                host_ready TINYINT(1) NOT NULL DEFAULT 0,
-                guest_ready TINYINT(1) NOT NULL DEFAULT 0,
-                status VARCHAR(16) NOT NULL DEFAULT 'waiting',
-                match_room_id VARCHAR(64) NULL,
-                match_round_no INT NOT NULL DEFAULT 1,
-                host_ticket_id VARCHAR(64) NULL,
-                guest_ticket_id VARCHAR(64) NULL,
-                matched_word VARCHAR(64) NULL,
-                expires_at DATETIME(3) NOT NULL,
-                created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-                updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-                UNIQUE KEY uk_friend_room_code (room_code),
-                KEY idx_friend_room_host_status (host_user_id, status, created_at),
-                KEY idx_friend_room_guest_status (guest_user_id, status, created_at),
-                KEY idx_friend_room_status_expires (status, expires_at),
-                CONSTRAINT fk_friend_room_host FOREIGN KEY (host_user_id) REFERENCES user_profile(user_id),
-                CONSTRAINT fk_friend_room_guest FOREIGN KEY (guest_user_id) REFERENCES user_profile(user_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`
-        );
+        const requiredTables = ["friend_room", "matchmaking_room", "matchmaking_ticket", "user_profile"];
+        for (const tableName of requiredTables) {
+            const [rows] = await db.execute(
+                `SELECT 1
+                 FROM INFORMATION_SCHEMA.TABLES
+                 WHERE TABLE_SCHEMA = DATABASE()
+                   AND TABLE_NAME = ?
+                 LIMIT 1`,
+                [tableName]
+            );
+            if (rows.length === 0) {
+                throw new Error(`Database migration required: missing table ${tableName}`);
+            }
+        }
 
-        await ensureColumn(db, "friend_room", "match_room_id", "match_room_id VARCHAR(64) NULL AFTER status");
-        await ensureColumn(db, "friend_room", "host_ticket_id", "host_ticket_id VARCHAR(64) NULL AFTER match_room_id");
-        await ensureColumn(db, "friend_room", "match_round_no", "match_round_no INT NOT NULL DEFAULT 1 AFTER match_room_id");
-        await ensureColumn(db, "friend_room", "guest_ticket_id", "guest_ticket_id VARCHAR(64) NULL AFTER host_ticket_id");
-        await ensureColumn(db, "friend_room", "matched_word", "matched_word VARCHAR(64) NULL AFTER guest_ticket_id");
+        const requiredColumns = [
+            "invite_id",
+            "room_code",
+            "host_user_id",
+            "guest_user_id",
+            "word_bank",
+            "language_level_code",
+            "host_ready",
+            "guest_ready",
+            "status",
+            "match_room_id",
+            "match_round_no",
+            "host_ticket_id",
+            "guest_ticket_id",
+            "matched_word",
+            "expires_at",
+            "created_at",
+            "updated_at"
+        ];
+        const [columnRows] = await db.query(
+            `SELECT COLUMN_NAME
+             FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE()
+               AND TABLE_NAME = 'friend_room'
+               AND COLUMN_NAME IN (${requiredColumns.map(() => "?").join(", ")})`,
+            requiredColumns
+        );
+        const presentColumns = new Set(columnRows.map(row => row.COLUMN_NAME));
+        const missingColumns = requiredColumns.filter(column => !presentColumns.has(column));
+        if (missingColumns.length > 0) {
+            throw new Error(`Database migration required: friend_room missing columns ${missingColumns.join(", ")}`);
+        }
     })().catch(error => {
         schemaInitializationPromise = null;
         throw error;
@@ -289,7 +279,7 @@ async function buildUniqueRoomCode(executor) {
     for (let attempt = 0; attempt < 20; attempt++) {
         const roomCode = buildRoomCode();
         const [rows] = await executor.execute(
-            "SELECT 1 FROM friend_room WHERE room_code = ? AND status IN ('waiting', 'joined') LIMIT 1",
+            "SELECT 1 FROM friend_room WHERE room_code = ? LIMIT 1",
             [roomCode]
         );
         if (rows.length === 0) {
@@ -301,13 +291,27 @@ async function buildUniqueRoomCode(executor) {
 }
 
 async function finalizeMatchIfReady(executor, room) {
-    if (!room ||
-        room.status === "matched" ||
-        Number(room.host_ready) !== 1 ||
+    if (!room || room.status === "matched") {
+        return room;
+    }
+
+    if (Number(room.host_ready) !== 1 ||
         Number(room.guest_ready) !== 1 ||
         Number(room.host_user_id) <= 0 ||
-        Number(room.guest_user_id) <= 0) {
+        Number(room.guest_user_id) <= 0 ||
+        Number(room.host_user_id) === Number(room.guest_user_id)) {
         return room;
+    }
+
+    const [userRows] = await executor.execute(
+        `SELECT user_id
+         FROM user_profile
+         WHERE user_id IN (?, ?)
+         ORDER BY user_id ASC`,
+        [room.host_user_id, room.guest_user_id]
+    );
+    if (userRows.length !== 2) {
+        throw new Error("Friend room participants are invalid");
     }
 
     const matchedWord = await pickWord(room.word_bank, executor);
@@ -369,17 +373,28 @@ async function create(req, res) {
         const wordBank = normalizeWordBank(req.body.word_bank || req.body.wordBank);
         const languageLevelCode = Number(req.body.language_level_code || getWordBankLevelCode(wordBank) || 0);
         const result = await withConnection(async connection => {
-            const roomCode = await buildUniqueRoomCode(connection);
-            const inviteId = buildInviteId();
+            for (let attempt = 0; attempt < 5; attempt++) {
+                const roomCode = await buildUniqueRoomCode(connection);
+                const inviteId = buildInviteId();
 
-            await connection.execute(
-                `INSERT INTO friend_room
-                    (invite_id, room_code, host_user_id, word_bank, language_level_code, status, expires_at)
-                 VALUES (?, ?, ?, ?, ?, 'waiting', CURRENT_TIMESTAMP(3) + INTERVAL ? MINUTE)`,
-                [inviteId, roomCode, hostUserId, wordBank, languageLevelCode, ROOM_TTL_MINUTES]
-            );
+                try {
+                    await connection.execute(
+                        `INSERT INTO friend_room
+                            (invite_id, room_code, host_user_id, word_bank, language_level_code, status, expires_at)
+                         VALUES (?, ?, ?, ?, ?, 'waiting', CURRENT_TIMESTAMP(3) + INTERVAL ? MINUTE)`,
+                        [inviteId, roomCode, hostUserId, wordBank, languageLevelCode, ROOM_TTL_MINUTES]
+                    );
 
-            return await loadRoomByInviteOrCode(connection, { inviteId }, false);
+                    return await loadRoomByInviteOrCode(connection, { inviteId }, false);
+                } catch (error) {
+                    if (error?.code !== "ER_DUP_ENTRY" ||
+                        !String(error.sqlMessage || error.message || "").includes("uk_friend_room_code")) {
+                        throw error;
+                    }
+                }
+            }
+
+            throw new Error("Unable to allocate unique friend room code");
         });
 
         return res.json(buildRoomResponse(result, hostUserId));

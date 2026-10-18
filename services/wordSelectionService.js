@@ -14,9 +14,9 @@ function buildVocabularySelectSql(selectColumns) {
 function buildLevelSelectSql(selectColumns, comparator) {
     return `SELECT ${selectColumns}
             FROM vocabulary v
-            INNER JOIN vocabulary_language_relation vlr
+            INNER JOIN vocabulary_level_relation vlr
                 ON vlr.word_id = v.word_id
-               AND vlr.language_level_code = ?
+               AND JSON_CONTAINS(vlr.language_level_codes, CAST(? AS JSON), '$')
             WHERE v.word_id ${comparator} ?
             ORDER BY v.word_id ${comparator === ">=" ? "ASC" : "DESC"}
             LIMIT 1`;
@@ -27,9 +27,9 @@ async function queryMinMaxWordId(executor, levelCode) {
         const [rows] = await executor.execute(
             `SELECT MIN(v.word_id) AS min_id, MAX(v.word_id) AS max_id
              FROM vocabulary v
-             INNER JOIN vocabulary_language_relation vlr
-                ON vlr.word_id = v.word_id
-               AND vlr.language_level_code = ?`,
+             INNER JOIN vocabulary_level_relation vlr
+                 ON vlr.word_id = v.word_id
+                AND JSON_CONTAINS(vlr.language_level_codes, CAST(? AS JSON), '$')`,
             [Number(levelCode)]
         );
         return rows[0] || null;

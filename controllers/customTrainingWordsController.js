@@ -1,27 +1,39 @@
 const db = require("../config/db");
 
-const MAX_TRAINING_WORDS = 7;
+const MAX_TRAINING_WORDS = 5;
 
 let schemaReadyPromise = null;
+
+async function assertSchema() {
+    const requiredColumns = [
+        "user_id",
+        "word_id",
+        "sort_order",
+        "created_at",
+        "updated_at"
+    ];
+    const [rows] = await db.execute(
+        `SELECT COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'user_custom_training_word'
+           AND COLUMN_NAME IN (${requiredColumns.map(() => "?").join(", ")})`,
+        requiredColumns
+    );
+
+    if (rows.length !== requiredColumns.length) {
+        const present = new Set(rows.map(row => row.COLUMN_NAME));
+        const missing = requiredColumns.filter(column => !present.has(column));
+        throw new Error(`Database migration required: user_custom_training_word missing columns ${missing.join(", ")}`);
+    }
+}
 
 async function ensureSchema() {
     if (schemaReadyPromise) {
         return schemaReadyPromise;
     }
 
-    schemaReadyPromise = db.execute(
-        `CREATE TABLE IF NOT EXISTS user_custom_training_word (
-            user_id BIGINT NOT NULL,
-            word_id INT NOT NULL,
-            sort_order TINYINT UNSIGNED NOT NULL,
-            created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-            updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-            PRIMARY KEY (user_id, word_id),
-            UNIQUE KEY uk_user_custom_training_word_order (user_id, sort_order),
-            CONSTRAINT user_custom_training_word_fk_user FOREIGN KEY (user_id) REFERENCES user_profile(user_id),
-            CONSTRAINT user_custom_training_word_fk_word FOREIGN KEY (word_id) REFERENCES vocabulary(word_id) ON DELETE CASCADE
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`
-    ).catch(error => {
+    schemaReadyPromise = assertSchema().catch(error => {
         schemaReadyPromise = null;
         throw error;
     });
@@ -102,13 +114,13 @@ async function loadTrainingWords(userId) {
              v.detail,
              v.word_type,
              ll.language_level_name AS word_bank,
-             vlr.language_level_code,
+             CAST(JSON_UNQUOTE(JSON_EXTRACT(vlr.language_level_codes, '$[0]')) AS UNSIGNED) AS language_level_code,
              uctw.sort_order
          FROM user_custom_training_word uctw
          INNER JOIN vocabulary v ON v.word_id = uctw.word_id
-         LEFT JOIN vocabulary_language_relation vlr ON vlr.word_id = v.word_id
+         LEFT JOIN vocabulary_level_relation vlr ON vlr.word_id = v.word_id
          LEFT JOIN language_level_code ll
-             ON ll.language_level_code = vlr.language_level_code
+             ON ll.language_level_code = CAST(JSON_UNQUOTE(JSON_EXTRACT(vlr.language_level_codes, '$[0]')) AS UNSIGNED)
          WHERE uctw.user_id = ?
          ORDER BY uctw.sort_order ASC
          LIMIT ${MAX_TRAINING_WORDS}`,

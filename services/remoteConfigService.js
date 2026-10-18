@@ -9,7 +9,7 @@ const RESOURCE_BADGE_KEY = "resource_badge";
 const ALLOWED_RESOURCE_BADGES = new Set(["prod", "test", "stage", "gray"]);
 const REQUEST_TIMEOUT_MS = Number(process.env.UOS_REMOTE_CONFIG_TIMEOUT_MS) || 2500;
 
-let schemaReady = false;
+let schemaReadyPromise = null;
 
 function normalizeOptionalString(value, maxLength = 255) {
     if (value == null) {
@@ -105,34 +105,46 @@ function extractBadge(responseData) {
 }
 
 async function ensureSchema() {
-    if (schemaReady) {
-        return;
+    if (schemaReadyPromise) {
+        return schemaReadyPromise;
     }
 
-    await db.execute(
-        `CREATE TABLE IF NOT EXISTS remote_config_event (
-            event_id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            user_id BIGINT NULL,
-            event_name VARCHAR(64) NOT NULL,
-            resource_badge VARCHAR(32) NOT NULL DEFAULT 'prod',
-            fallback TINYINT(1) NOT NULL DEFAULT 0,
-            source VARCHAR(32) NULL,
-            reason VARCHAR(255) NULL,
-            app_version VARCHAR(64) NULL,
-            release_id VARCHAR(64) NULL,
-            platform VARCHAR(64) NULL,
-            device_model VARCHAR(128) NULL,
-            os_version VARCHAR(64) NULL,
-            duration_ms INT NULL,
-            detail_json JSON NULL,
-            created_at DATETIME(6) NOT NULL,
-            KEY idx_remote_config_event_badge_time (resource_badge, created_at),
-            KEY idx_remote_config_event_user_time (user_id, created_at),
-            KEY idx_remote_config_event_name_time (event_name, created_at)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
-    );
+    const requiredColumns = [
+        "event_id",
+        "user_id",
+        "event_name",
+        "resource_badge",
+        "fallback",
+        "source",
+        "reason",
+        "app_version",
+        "release_id",
+        "platform",
+        "device_model",
+        "os_version",
+        "duration_ms",
+        "detail_json",
+        "created_at"
+    ];
+    schemaReadyPromise = db.execute(
+        `SELECT COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'remote_config_event'
+           AND COLUMN_NAME IN (${requiredColumns.map(() => "?").join(", ")})`,
+        requiredColumns
+    ).then(([rows]) => {
+        if (rows.length !== requiredColumns.length) {
+            const present = new Set(rows.map(row => row.COLUMN_NAME));
+            const missing = requiredColumns.filter(column => !present.has(column));
+            throw new Error(`Database migration required: remote_config_event missing columns ${missing.join(", ")}`);
+        }
+    }).catch(error => {
+        schemaReadyPromise = null;
+        throw error;
+    });
 
-    schemaReady = true;
+    return schemaReadyPromise;
 }
 
 async function insertEvent(payload) {
