@@ -209,10 +209,12 @@ exports.getRoomActionLogs = async (req, res) => {
             return res.status(403).json({ success: false, message: "你不在这个真人房间中" });
         }
 
+        const queryParams = [matchRoomId, viewerUserId, viewerUserId, viewerUserId];
         const matchRoundClause = matchRoundNo > 0 ? " AND usss.match_round_no = ?" : "";
-        const queryParams = matchRoundNo > 0
-            ? [matchRoomId, viewerUserId, viewerUserId, matchRoundNo, viewerUserId, afterId]
-            : [matchRoomId, viewerUserId, viewerUserId, viewerUserId, afterId];
+        if (matchRoundNo > 0) {
+            queryParams.push(matchRoundNo);
+        }
+        queryParams.push(afterId);
 
         const [rows] = await db.execute(
             `SELECT al.action_log_id,
