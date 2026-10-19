@@ -211,8 +211,8 @@ exports.getRoomActionLogs = async (req, res) => {
 
         const matchRoundClause = matchRoundNo > 0 ? " AND usss.match_round_no = ?" : "";
         const queryParams = matchRoundNo > 0
-            ? [matchRoomId, viewerUserId, matchRoundNo, afterId]
-            : [matchRoomId, viewerUserId, afterId];
+            ? [matchRoomId, viewerUserId, viewerUserId, matchRoundNo, viewerUserId, afterId]
+            : [matchRoomId, viewerUserId, viewerUserId, viewerUserId, afterId];
 
         const [rows] = await db.execute(
             `SELECT al.action_log_id,
@@ -226,8 +226,28 @@ exports.getRoomActionLogs = async (req, res) => {
              FROM action_log al
              INNER JOIN action_type at ON at.action_type_id = al.action_type_id
              INNER JOIN user_study_session_summary usss ON usss.session_id = al.session_id
-             WHERE usss.match_room_id = ?
-               AND al.user_id <> ?
+             INNER JOIN matchmaking_room mr
+                ON mr.room_id = ?
+               AND mr.opponent_type = 'human'
+               AND (
+                    (mr.user1_id = ? AND al.user_id = mr.user2_id)
+                    OR (mr.user2_id = ? AND al.user_id = mr.user1_id)
+               )
+             WHERE (
+                    usss.match_room_id = mr.room_id
+                    OR EXISTS (
+                        SELECT 1
+                        FROM matchmaking_ticket mt
+                        WHERE mt.ticket_id = usss.match_ticket_id
+                          AND mt.room_id = mr.room_id
+                          AND mt.user_id = al.user_id
+                    )
+                    OR (
+                        usss.matchmaking_opponent_type = 'human'
+                        AND usss.matchmaking_opponent_user_id = ?
+                        AND (usss.match_room_id IS NULL OR usss.match_ticket_id IS NULL)
+                    )
+               )
                ${matchRoundClause}
                AND al.action_log_id > ?
              ORDER BY al.action_log_id ASC
