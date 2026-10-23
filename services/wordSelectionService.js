@@ -2,6 +2,8 @@ const db = require("../config/db");
 const { getWordBankLevelCode, normalizeWordBank } = require("./wordBankService");
 
 const RANDOM_ID_ATTEMPTS = Math.max(1, Number(process.env.WORD_SELECTION_RANDOM_ID_ATTEMPTS) || 8);
+const PRACTICE_WORD_BATCH_SIZE = 7;
+const MAX_CUSTOM_TRAINING_WORDS = 5;
 
 function buildVocabularySelectSql(selectColumns) {
     return `SELECT ${selectColumns}
@@ -108,6 +110,33 @@ async function pickRandomWordForm(wordBank, executor = db) {
     return row?.word_form || null;
 }
 
+async function pickCustomTrainingWordForm(userId, roundNo, executor = db) {
+    const normalizedUserId = Number(userId);
+    const normalizedRoundNo = Number(roundNo);
+    if (!Number.isInteger(normalizedUserId) ||
+        normalizedUserId <= 0 ||
+        !Number.isInteger(normalizedRoundNo) ||
+        normalizedRoundNo <= 0) {
+        return null;
+    }
+
+    const batchIndex = (normalizedRoundNo - 1) % PRACTICE_WORD_BATCH_SIZE;
+    if (batchIndex >= MAX_CUSTOM_TRAINING_WORDS) {
+        return null;
+    }
+
+    const [rows] = await executor.execute(
+        `SELECT v.word_form
+         FROM user_custom_training_word uctw
+         INNER JOIN vocabulary v ON v.word_id = uctw.word_id
+         WHERE uctw.user_id = ?
+         ORDER BY uctw.sort_order ASC
+         LIMIT 1 OFFSET ${batchIndex}`,
+        [normalizedUserId]
+    );
+    return rows[0]?.word_form || null;
+}
+
 async function pickRandomStudyWord(wordBank, executor = db) {
     return await pickRandomWordRow({
         wordBank,
@@ -118,5 +147,6 @@ async function pickRandomStudyWord(wordBank, executor = db) {
 
 module.exports = {
     pickRandomStudyWord,
-    pickRandomWordForm
+    pickRandomWordForm,
+    pickCustomTrainingWordForm
 };

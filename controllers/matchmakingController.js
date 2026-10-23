@@ -7,7 +7,10 @@ const {
 const {
     abandonMatchedRoom
 } = require("../services/matchRoomLifecycleService");
-const { pickRandomWordForm } = require("../services/wordSelectionService");
+const {
+    pickRandomWordForm,
+    pickCustomTrainingWordForm
+} = require("../services/wordSelectionService");
 const { formatChinaIsoDateTime } = require("../services/timeService");
 
 const DEFAULT_MATCH_TIMEOUT_MS = Math.max(1000, Number(process.env.MATCH_TIMEOUT_MS) || 5000);
@@ -242,6 +245,18 @@ async function initializeMatchmakingSchema() {
 
 async function pickWord(wordBank, executor = db) {
     return await pickRandomWordForm(wordBank, executor);
+}
+
+async function loadFriendRoomForMatch(executor, roomId) {
+    const [rows] = await executor.execute(
+        `SELECT invite_id, host_user_id
+         FROM friend_room
+         WHERE match_room_id = ?
+           AND status = 'matched'
+         LIMIT 1`,
+        [roomId]
+    );
+    return rows[0] || null;
 }
 
 async function loadTicket(executor, ticketId, lockRow = false) {
@@ -831,7 +846,12 @@ exports.rematch = async (req, res) => {
 
                 if (selfReadyRoundNo >= previousRoundNo && opponentReadyRoundNo >= previousRoundNo) {
                     const nextRoundNo = previousRoundNo + 1;
-                    const matchedWord = await pickWord(updatedRoom.word_bank, connection);
+                    const friendRoom = await loadFriendRoomForMatch(connection, roomId);
+                    const matchedWord =
+                        friendRoom != null
+                            ? await pickCustomTrainingWordForm(friendRoom.host_user_id, nextRoundNo, connection) ||
+                              await pickWord(updatedRoom.word_bank, connection)
+                            : await pickWord(updatedRoom.word_bank, connection);
                     if (!matchedWord) {
                         throw new Error("No match word available");
                     }
@@ -858,6 +878,16 @@ exports.rematch = async (req, res) => {
                          WHERE room_id = ? AND status = 'matched'`,
                         [matchedWord, updatedRoom.word_bank, nextRoundNo, roomId]
                     );
+
+                    if (friendRoom != null) {
+                        await connection.execute(
+                            `UPDATE friend_room
+                             SET match_round_no = ?,
+                                 matched_word = ?
+                             WHERE invite_id = ?`,
+                            [nextRoundNo, matchedWord, friendRoom.invite_id]
+                        );
+                    }
 
                     const ticket = await loadMatchedTicketByRoomAndUser(connection, roomId, userId);
                     if (!ticket) {

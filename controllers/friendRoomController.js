@@ -7,7 +7,10 @@ const {
 const {
     abandonMatchedRoom
 } = require("../services/matchRoomLifecycleService");
-const { pickRandomWordForm } = require("../services/wordSelectionService");
+const {
+    pickRandomWordForm,
+    pickCustomTrainingWordForm
+} = require("../services/wordSelectionService");
 const { formatChinaIsoDateTime } = require("../services/timeService");
 
 const ROOM_TTL_MINUTES = Math.max(5, Number(process.env.FRIEND_ROOM_TTL_MINUTES) || 30);
@@ -314,7 +317,9 @@ async function finalizeMatchIfReady(executor, room) {
         throw new Error("Friend room participants are invalid");
     }
 
-    const matchedWord = await pickWord(room.word_bank, executor);
+    const matchedWord =
+        await pickCustomTrainingWordForm(room.host_user_id, 1, executor) ||
+        await pickWord(room.word_bank, executor);
     if (!matchedWord) {
         throw new Error("No match word available");
     }
