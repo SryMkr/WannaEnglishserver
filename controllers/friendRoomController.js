@@ -668,11 +668,24 @@ async function leave(req, res) {
                     return { statusCode: 403, body: { success: false, message: "你不在这个房间中" } };
                 }
 
+                const isHost = Number(room.host_user_id) === userId;
                 if (room.match_room_id) {
                     await abandonMatchedRoom(connection, room.match_room_id);
+                } else if (isHost) {
+                    await connectionSafeCancelFriendRoom(connection, room.invite_id);
+                } else {
+                    await connection.execute(
+                        `UPDATE friend_room
+                         SET guest_user_id = NULL,
+                             guest_ready = 0,
+                             status = 'waiting'
+                         WHERE invite_id = ?
+                           AND guest_user_id = ?
+                           AND status IN ('waiting', 'joined')`,
+                        [room.invite_id, userId]
+                    );
                 }
 
-                await connectionSafeCancelFriendRoom(connection, room.invite_id);
                 const updated = await loadRoomByInviteOrCode(connection, { inviteId: room.invite_id }, false);
                 await connection.commit();
                 return { statusCode: 200, body: buildRoomResponse(updated, userId) };
