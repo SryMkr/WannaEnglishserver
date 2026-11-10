@@ -57,6 +57,12 @@ CREATE TABLE IF NOT EXISTS matchmaking_ticket (
     CONSTRAINT fk_matchmaking_ticket_room FOREIGN KEY (room_id) REFERENCES matchmaking_room(room_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS user_online_presence (
+    user_id BIGINT NOT NULL PRIMARY KEY,
+    last_seen_at DATETIME(3) NOT NULL,
+    KEY idx_user_online_presence_last_seen (last_seen_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS friend_room (
     invite_id VARCHAR(64) PRIMARY KEY,
     room_code VARCHAR(8) NOT NULL,

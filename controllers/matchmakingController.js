@@ -20,6 +20,7 @@ const ROOM_RESUME_GRACE_SECONDS = Math.max(
     Number(process.env.MATCH_ROOM_RESUME_GRACE_SECONDS) || 60
 );
 const REMATCH_WAIT_TIMEOUT_SECONDS = Math.max(5, Number(process.env.MATCH_REMATCH_WAIT_TIMEOUT_SECONDS) || 20);
+const ONLINE_PRESENCE_TTL_SECONDS = 60;
 
 let schemaInitializationPromise = null;
 
@@ -614,6 +615,61 @@ async function refreshTicketIfExpired(ticketId, timeoutMs = DEFAULT_MATCH_TIMEOU
 }
 
 exports.initializeMatchmakingSchema = initializeMatchmakingSchema;
+
+exports.onlineHeartbeat = async (req, res) => {
+    try {
+        const userId = Number(req.body.user_id);
+        if (!Number.isInteger(userId) || userId <= 0) {
+            return res.status(400).json({ success: false, message: "user_id 无效" });
+        }
+
+        const [userRows] = await db.execute(
+            "SELECT user_id FROM user_profile WHERE user_id = ? LIMIT 1",
+            [userId]
+        );
+        if (userRows.length === 0) {
+            return res.status(404).json({ success: false, message: "用户不存在" });
+        }
+
+        await db.execute(
+            `INSERT INTO user_online_presence (user_id, last_seen_at)
+             VALUES (?, CURRENT_TIMESTAMP(3))
+             ON DUPLICATE KEY UPDATE last_seen_at = CURRENT_TIMESTAMP(3)`,
+            [userId]
+        );
+
+        return res.json({ success: true });
+    } catch (err) {
+        console.error("matchmaking online heartbeat error:", err);
+        return res.status(500).json({ success: false, message: "Server error" });
+    }
+};
+
+exports.getStatistics = async (_req, res) => {
+    try {
+        const [onlineRows] = await db.execute(
+            `SELECT COUNT(*) AS online_count
+             FROM user_online_presence
+             WHERE last_seen_at >= DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL ? SECOND)`,
+            [ONLINE_PRESENCE_TTL_SECONDS]
+        );
+        const [matchmakingRows] = await db.execute(
+            `SELECT COUNT(DISTINCT user_id) AS matchmaking_count
+             FROM matchmaking_ticket
+             WHERE status = 'waiting'
+               AND fallback_at > CURRENT_TIMESTAMP(3)`
+        );
+
+        return res.json({
+            success: true,
+            online_count: Number(onlineRows[0]?.online_count || 0),
+            matchmaking_count: Number(matchmakingRows[0]?.matchmaking_count || 0)
+        });
+    } catch (err) {
+        console.error("matchmaking statistics error:", err);
+        return res.status(500).json({ success: false, message: "Server error" });
+    }
+};
 
 exports.enqueue = async (req, res) => {
     try {

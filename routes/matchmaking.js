@@ -2,6 +2,8 @@ const express = require("express");
 const router = express.Router();
 const controller = require("../controllers/matchmakingController");
 
+router.post("/online-heartbeat", controller.onlineHeartbeat);
+router.get("/statistics", controller.getStatistics);
 router.post("/enqueue", controller.enqueue);
 router.get("/status", controller.getStatus);
 router.post("/cancel", controller.cancel);
